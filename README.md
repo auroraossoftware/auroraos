@@ -547,3 +547,5 @@ Aurora aims to explore that question without throwing away the decades of engine
 **Build on Linux. Keep AI modular. Protect the user. Prefer simplicity. Document the reasoning.**
 
 </div>
+
+[![Powered by DartNode](https://dartnode.com/branding/DN-Open-Source-sm.png)](https://dartnode.com "Powered by DartNode - Free VPS for Open Source")
