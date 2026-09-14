@@ -1,0 +1,2229 @@
+# Aurora OS Architecture
+
+**Status:** Proposed
+**Version:** 0.1
+**Last Updated:** 2026-09-13
+
+---
+
+## 1. Purpose
+
+This document defines the technical architecture of **Aurora OS**, an experimental AI-native desktop operating system built on top of the Linux kernel.
+
+The purpose of this document is to establish:
+
+- the major components of Aurora OS;
+- the responsibilities and boundaries of those components;
+- how components communicate;
+- how AI is integrated into the operating system;
+- how applications interact with system-level AI capabilities;
+- security and privacy boundaries;
+- how software and AI models can be replaced without redesigning the operating system;
+- how Aurora can evolve from an experimental prototype into a maintainable operating system.
+
+This document is an architectural specification, not an implementation guide.
+
+Specific technologies may change during development if experimentation demonstrates that another solution provides better security, reliability, maintainability, or performance.
+
+---
+
+## 2. Architectural Vision
+
+Traditional operating systems generally treat AI as an application.
+
+A user launches an AI application, gives it information, and receives a response.
+
+Aurora OS takes a different approach:
+
+> **AI is a system capability that applications and system components can use through controlled operating-system interfaces.**
+
+The goal is not to make every application contain its own AI model.
+
+Instead, Aurora provides a shared AI service.
+
+```
+Traditional Model
+
+┌──────────────┐
+│ Application  │
+│              │
+│ ┌──────────┐ │
+│ │ AI Model │ │
+│ └──────────┘ │
+└──────────────┘
+
+
+Aurora Model
+
+┌──────────────┐
+│ Application  │
+└───────┬──────┘
+        │
+        │ AI API
+        ▼
+┌──────────────────────┐
+│  Aurora AI Service   │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│    Model Runtime     │
+└──────────┬───────────┘
+           │
+           ▼
+    Local / Remote Model
+
+```
+
+This architecture provides several important properties:
+
+1. **Centralization of AI infrastructure**
+2. **Consistent privacy controls**
+3. **Model replaceability**
+4. **Shared context mechanisms**
+5. **Common security policies**
+6. **Reduced duplication between applications**
+7. **A stable API for future AI capabilities**
+
+However, centralization must not become excessive coupling.
+
+Aurora therefore treats the AI service as a **platform service**, not as the operating system itself.
+
+If the AI service crashes, the operating system must continue functioning.
+
+---
+
+## 3. Architectural Principles
+
+Aurora follows the following principles.
+
+### 3.1 Linux First
+
+Aurora is built on the Linux kernel.
+
+Aurora will not attempt to replace Linux with a custom kernel.
+
+Linux already provides mature implementations of:
+
+- process management;
+- scheduling;
+- virtual memory;
+- filesystems;
+- networking;
+- device management;
+- security primitives;
+- hardware drivers;
+- namespaces;
+- control groups;
+- system calls.
+
+Aurora's innovation should therefore occur primarily in **userspace and system integration**, rather than recreating functionality already provided by Linux.
+
+---
+
+### 3.2 AI Is a Service, Not the Operating System
+
+The AI subsystem is important, but it must remain modular.
+
+Aurora must remain usable if:
+
+- the AI model is unavailable;
+- the model crashes;
+- the GPU is unavailable;
+- inference is too slow;
+- a cloud provider is unavailable;
+- the user disables AI;
+- an AI request fails.
+
+AI failure must never become operating-system failure.
+
+---
+
+### 3.3 Least Privilege
+
+Every component should have the minimum permissions required to perform its job.
+
+In particular:
+
+> **The AI service must not automatically receive unrestricted access to the user's computer.**
+
+An AI model should not inherently be able to:
+
+- execute arbitrary commands;
+- modify system files;
+- read private files;
+- access microphones;
+- access cameras;
+- access network resources;
+- install software.
+
+Those capabilities must be mediated by explicit system interfaces and permissions.
+
+---
+
+### 3.4 Stable Interfaces
+
+Components should communicate through clearly defined interfaces.
+
+An implementation may change without forcing every dependent component to change.
+
+For example:
+
+```
+Application
+     │
+     ▼
+Aurora AI API
+     │
+     ▼
+AI Service
+     │
+     ▼
+Model Abstraction
+     │
+     ├── Local Model
+     ├── Different Local Model
+     └── Optional Cloud Provider
+
+```
+
+The application should not need to know which model is being used.
+
+---
+
+### 3.5 Existing Infrastructure Before Custom Infrastructure
+
+Aurora should use mature Linux infrastructure whenever practical.
+
+Examples include:
+
+- Linux kernel;
+- systemd;
+- D-Bus;
+- Wayland;
+- PipeWire;
+- standard Linux filesystems;
+- existing package-management infrastructure;
+- existing security frameworks;
+- existing application sandboxing mechanisms.
+
+A custom Aurora implementation should be introduced only when existing infrastructure cannot adequately satisfy the requirement.
+
+---
+
+### 3.6 Privacy by Architecture
+
+Privacy should not depend entirely on user promises or application behavior.
+
+The architecture should make unsafe behavior difficult.
+
+The default design should favor:
+
+```
+User Data
+   │
+   ▼
+Local Processing
+   │
+   ▼
+Result
+
+```
+
+rather than:
+
+```
+User Data
+   │
+   ▼
+Internet
+   │
+   ▼
+External AI Provider
+
+```
+
+Cloud AI may be supported, but it should be an explicit provider with clear privacy semantics.
+
+---
+
+## 4. System Overview
+
+Aurora is divided into several layers.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    User Applications                    │
+│                                                         │
+│ Browser │ Editor │ Terminal │ Media │ Third-party Apps  │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          │ Standard OS APIs / Portals
+                          │ Aurora APIs where appropriate
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                  Aurora Desktop Layer                    │
+│                                                         │
+│ Shell │ Launcher │ Notifications │ Search │ Settings    │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                 Aurora System Services                  │
+│                                                         │
+│ AI Service │ Context │ Permissions │ Updates │ Search   │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                  Linux Userspace                        │
+│                                                         │
+│ systemd │ D-Bus │ Wayland │ PipeWire │ libraries       │
+│ filesystems │ networking │ package infrastructure       │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                     Linux Kernel                        │
+│                                                         │
+│ Scheduler │ Memory │ Drivers │ Networking │ Security    │
+│ Filesystems │ Processes │ Namespaces │ cgroups          │
+└─────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## 5. Architectural Layers
+
+### 5.1 Hardware
+
+Aurora ultimately executes on physical hardware.
+
+Examples include:
+
+- CPU;
+- GPU;
+- RAM;
+- storage;
+- network adapters;
+- audio hardware;
+- display hardware;
+- input devices;
+- cameras;
+- microphones.
+
+Aurora should avoid directly managing hardware when an established Linux subsystem already provides the required functionality.
+
+---
+
+## 5.2 Linux Kernel
+
+The Linux kernel forms the lowest software layer of Aurora.
+
+Aurora relies on the kernel for:
+
+- process scheduling;
+- memory management;
+- hardware drivers;
+- filesystems;
+- networking;
+- device access;
+- process isolation;
+- namespaces;
+- cgroups;
+- security mechanisms;
+- system calls.
+
+Aurora-specific software should remain primarily outside the kernel.
+
+### Kernel modification policy
+
+Kernel modifications should be considered only when absolutely necessary.
+
+The preferred order is:
+
+1. Existing Linux API
+2. Existing userspace subsystem
+3. Existing kernel configuration
+4. Existing kernel module
+5. Aurora userspace solution
+6. Kernel modification as a last resort
+
+This keeps Aurora maintainable across future Linux kernel versions.
+
+---
+
+## 5.3 Linux Userspace
+
+Linux userspace provides the foundation upon which Aurora services operate.
+
+Important components may include:
+
+- `systemd` for service management;
+- D-Bus for system IPC;
+- Wayland for graphical display;
+- PipeWire for multimedia;
+- standard Linux libraries;
+- networking services;
+- filesystem infrastructure;
+- package-management infrastructure.
+
+Aurora should integrate with these systems rather than unnecessarily replacing them.
+
+---
+
+## 6. Aurora System Services
+
+Aurora-specific functionality lives primarily in userspace services.
+
+Potential services include:
+
+```
+aurora-ai
+aurora-context
+aurora-search
+aurora-settings
+aurora-update
+aurora-notification
+
+```
+
+Not all of these need to exist in the MVP.
+
+The architecture deliberately allows services to be added independently.
+
+---
+
+## 7. Aurora AI Service
+
+The **Aurora AI Service** is the central AI integration point of the operating system.
+
+Its purpose is to provide controlled AI capabilities to authorized applications and system components.
+
+It should not itself be responsible for every AI-related task.
+
+Instead, it acts as an orchestrator and policy boundary.
+
+---
+
+### 7.1 Responsibilities
+
+The Aurora AI Service may eventually be responsible for:
+
+- accepting AI requests;
+- authenticating callers;
+- enforcing permissions;
+- selecting an AI provider;
+- managing model lifecycle;
+- managing inference requests;
+- streaming responses;
+- managing AI context;
+- applying privacy policies;
+- tracking resource usage;
+- exposing model capabilities;
+- handling failures;
+- terminating unhealthy model workers.
+
+It should **not** directly implement every AI feature.
+
+---
+
+## 8. AI Service Architecture
+
+The AI service should be divided internally into layers.
+
+```
+┌──────────────────────────────────────┐
+│             Client API               │
+│                                      │
+│ Applications / Aurora UI / Services  │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│          Request Manager             │
+│                                      │
+│ Validation │ Rate Limits │ Routing   │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│        Permission & Policy           │
+│                                      │
+│ Identity │ Permissions │ Privacy     │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│       Context / Tool Layer           │
+│                                      │
+│ Files │ Apps │ System State │ Tools  │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│       Model Provider Interface       │
+└───────────────┬───────────────┬──────┘
+                │               │
+                ▼               ▼
+        ┌─────────────┐  ┌─────────────┐
+        │ Local Model │  │ Cloud Model │
+        └─────────────┘  └─────────────┘
+
+```
+
+The critical architectural boundary is the **Model Provider Interface**.
+
+---
+
+## 9. Model Provider Abstraction
+
+Aurora should not hard-code a particular AI model into the operating system.
+
+Instead:
+
+```
+Aurora AI API
+      │
+      ▼
+Provider Interface
+      │
+ ┌────┴─────┬─────────────┐
+ ▼          ▼             ▼
+Local A     Local B       Cloud A
+
+```
+
+This allows Aurora to support different models over time.
+
+For example, a future installation could use:
+
+- a small CPU model;
+- a larger GPU model;
+- a different local model;
+- an optional cloud provider.
+
+Applications should not need to change when the underlying model changes.
+
+---
+
+## 10. Model Lifecycle
+
+A model should not necessarily remain loaded at all times.
+
+Aurora may eventually support states such as:
+
+```
+UNAVAILABLE
+     │
+     ▼
+AVAILABLE
+     │
+     ▼
+LOADING
+     │
+     ▼
+READY
+     │
+     ▼
+INFERENCE
+     │
+     ▼
+READY
+     │
+     ▼
+UNLOADING
+
+```
+
+This is important because AI models can consume substantial:
+
+- RAM;
+- VRAM;
+- CPU;
+- GPU;
+- storage;
+- battery power.
+
+Aurora should eventually be capable of making resource-aware decisions.
+
+---
+
+## 11. AI Worker Isolation
+
+The model runtime should preferably be isolated from the main AI service.
+
+Instead of:
+
+```
+aurora-ai
+   └── model runtime
+
+```
+
+prefer:
+
+```
+aurora-ai
+     │
+     │ controlled interface
+     ▼
+AI Worker
+     │
+     ▼
+Model Runtime
+
+```
+
+The reason is fault containment.
+
+If a model runtime crashes:
+
+```
+AI Worker crashes
+       ↓
+AI Service detects failure
+       ↓
+AI Worker restarted
+       ↓
+Applications continue running
+
+```
+
+The main system should not need to restart.
+
+---
+
+## 12. Tool and Action Architecture
+
+One of the most important architectural decisions in Aurora is separating:
+
+> **Generating a suggestion**
+
+from
+
+> **performing an action**
+
+For example, an AI model might produce:
+
+```
+"Open the settings application."
+
+```
+
+That does not mean the model should execute a shell command.
+
+Instead:
+
+```
+AI Model
+   │
+   │ requests action
+   ▼
+Aurora Tool Interface
+   │
+   ▼
+Permission Check
+   │
+   ▼
+System Action
+
+```
+
+This creates a security boundary.
+
+---
+
+## 13. Tool Permissions
+
+Tools should have explicit capabilities.
+
+Conceptually:
+
+```
+Capability: READ_FILE
+Capability: WRITE_FILE
+Capability: OPEN_APPLICATION
+Capability: CHANGE_SETTING
+Capability: NETWORK_REQUEST
+Capability: MICROPHONE
+Capability: CAMERA
+Capability: EXECUTE_COMMAND
+
+```
+
+An AI request should be evaluated against the permissions of the calling application and the user's policy.
+
+The existence of a tool does not automatically grant the AI permission to use it.
+
+---
+
+## 14. Dangerous Operations
+
+High-impact operations should receive additional protection.
+
+Examples include:
+
+- deleting files;
+- modifying system configuration;
+- installing software;
+- changing security settings;
+- executing arbitrary commands;
+- accessing sensitive personal data;
+- changing network configuration.
+
+Aurora should prefer:
+
+```
+AI → Proposed Action → User/System Policy → Action
+
+```
+
+over:
+
+```
+AI → Immediate Action
+
+```
+
+For especially sensitive operations, explicit user confirmation should be required.
+
+---
+
+## 15. IPC Architecture
+
+Aurora requires several types of inter-process communication.
+
+The architecture should distinguish between:
+
+1. **System IPC**
+2. **Application IPC**
+3. **High-performance private IPC**
+4. **Network communication**
+
+These do not necessarily need to use the same technology.
+
+---
+
+### 15.1 D-Bus
+
+D-Bus is the primary candidate for Aurora's system-level IPC.
+
+It is particularly appropriate because Aurora is a Linux desktop system and many existing Linux desktop/system components already use D-Bus.
+
+Potential uses include:
+
+```
+Aurora UI
+    │
+    ├── D-Bus ──> Aurora AI
+    │
+    ├── D-Bus ──> Aurora Settings
+    │
+    └── D-Bus ──> Aurora Notifications
+
+```
+
+### Advantages
+
+- designed for local IPC;
+- integrates naturally with Linux desktop environments;
+- supports service discovery;
+- supports structured messages;
+- provides an established security/policy model;
+- language bindings are available.
+
+### Disadvantages
+
+- introduces D-Bus-specific concepts;
+- not ideal for every high-throughput workload;
+- inappropriate as a general-purpose network API.
+
+---
+
+## 15.2 Unix Domain Sockets
+
+Unix domain sockets are another important IPC mechanism.
+
+They may be appropriate for:
+
+- private Aurora service interfaces;
+- high-frequency communication;
+- model-worker communication;
+- specialized internal protocols.
+
+Advantages include:
+
+- local-only communication;
+- low overhead;
+- filesystem-based access control;
+- broad language support.
+
+However, Aurora should not introduce raw socket protocols everywhere simply because they are fast.
+
+**Performance should not be optimized before measurement demonstrates a real requirement.**
+
+---
+
+## 15.3 gRPC
+
+gRPC may be useful in specific circumstances, particularly where Aurora eventually needs:
+
+- network communication;
+- language-independent APIs;
+- streaming;
+- communication between separately deployed components.
+
+However, gRPC should not automatically become Aurora's default local desktop IPC mechanism.
+
+It introduces additional infrastructure that may not be necessary for a tightly integrated Linux desktop.
+
+---
+
+## 15.4 REST
+
+REST/HTTP may be useful for:
+
+- developer APIs;
+- external integrations;
+- remote services;
+- web-based management interfaces.
+
+It should not be the default mechanism for internal operating-system communication.
+
+---
+
+## 15.5 IPC Decision
+
+The initial architecture should therefore be:
+
+| Requirement | Preferred mechanism |
+|---|---|
+| Linux system IPC | D-Bus |
+| Private high-performance local IPC | Unix domain socket where justified |
+| Remote/network API | gRPC or HTTPS API where justified |
+| Web integration | HTTPS/REST where appropriate |
+| Shared-memory data | Only when profiling demonstrates a need |
+
+This keeps the architecture simple without preventing future optimization.
+
+---
+
+## 16. Aurora API
+
+Applications should interact with Aurora through stable APIs rather than directly interacting with model runtimes.
+
+Conceptually:
+
+```
+Application
+     │
+     ▼
+Aurora API
+     │
+     ▼
+Aurora AI Service
+
+```
+
+Possible future operations include:
+
+```
+GetCapabilities()
+CreateRequest()
+StreamResponse()
+CancelRequest()
+GetModelStatus()
+RequestTool()
+GetPrivacyPolicy()
+
+```
+
+The exact API is intentionally not finalized in this architecture document.
+
+The API should be specified separately once the first implementation is prototyped.
+
+---
+
+## 17. Request Lifecycle
+
+A typical AI request should follow a controlled pipeline.
+
+```
+1. Application creates request
+            │
+            ▼
+2. Aurora authenticates caller
+            │
+            ▼
+3. Request validated
+            │
+            ▼
+4. Permissions evaluated
+            │
+            ▼
+5. Context selected
+            │
+            ▼
+6. AI provider selected
+            │
+            ▼
+7. Model inference
+            │
+            ▼
+8. Tool request, if necessary
+            │
+            ▼
+9. Tool permission check
+            │
+            ▼
+10. Result returned
+
+```
+
+The model should not bypass this pipeline.
+
+---
+
+## 18. Context Architecture
+
+A major future capability of Aurora is **system-wide context**.
+
+However, context must not mean:
+
+> "Give the AI access to everything."
+
+Instead, Aurora should use controlled context providers.
+
+Examples:
+
+```
+Application Context
+        │
+        ├── Current application
+        ├── Current document
+        └── Current selection
+
+System Context
+        │
+        ├── Battery
+        ├── Network state
+        └── Device state
+
+User Context
+        │
+        ├── Explicit preferences
+        └── User-approved information
+
+File Context
+        │
+        └── Explicitly authorized files
+
+```
+
+Each context source should have an explicit security boundary.
+
+---
+
+## 19. Context Minimization
+
+Aurora should follow a **minimum necessary context** principle.
+
+If an application asks:
+
+```
+"Summarize this document."
+
+```
+
+the AI should receive the relevant document rather than unrestricted access to the user's filesystem.
+
+This reduces:
+
+- privacy exposure;
+- accidental data leakage;
+- prompt injection impact;
+- unnecessary processing;
+- model context usage.
+
+---
+
+## 20. Prompt Injection and Untrusted Data
+
+Aurora must treat external content as **untrusted data**.
+
+Examples include:
+
+- webpages;
+- emails;
+- downloaded documents;
+- PDFs;
+- application data;
+- files;
+- messages.
+
+Content inside these sources may attempt to manipulate an AI system.
+
+Therefore:
+
+```
+Untrusted Content
+       │
+       ▼
+AI Context
+       │
+       ▼
+Policy Boundary
+       │
+       ▼
+Tools / Actions
+
+```
+
+The AI must not interpret arbitrary text as authorization to perform privileged operations.
+
+---
+
+## 21. Desktop Architecture
+
+Aurora's desktop layer provides the graphical user experience.
+
+Conceptually:
+
+```
+┌──────────────────────────────────────┐
+│              Aurora Shell             │
+│                                      │
+│ Launcher │ Panels │ Notifications    │
+│ Search   │ Workspace │ AI interface  │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+              Wayland
+                   │
+                   ▼
+             Linux graphics
+
+```
+
+Aurora should use existing Linux graphical infrastructure wherever possible.
+
+---
+
+## 22. Aurora Shell
+
+The Aurora Shell may eventually provide:
+
+- application launcher;
+- system search;
+- notifications;
+- workspace management;
+- system controls;
+- AI interaction;
+- quick actions;
+- accessibility features.
+
+The shell should remain primarily a user-interface layer.
+
+It should not contain the core AI model.
+
+---
+
+## 23. System Search
+
+Aurora Search is a potential future system service.
+
+Instead of applications implementing unrelated search systems, Aurora may provide a common search interface.
+
+Possible searchable objects include:
+
+- applications;
+- files;
+- settings;
+- documents;
+- system information;
+- user-approved AI-generated indexes.
+
+Architecture:
+
+```
+Application / Shell
+        │
+        ▼
+   Aurora Search
+        │
+   ┌────┼─────┐
+   ▼    ▼     ▼
+ Files Apps Settings
+
+```
+
+AI may enhance search, but conventional deterministic search should remain available.
+
+---
+
+## 24. Settings Architecture
+
+System settings should be represented through explicit system APIs.
+
+AI should not directly edit arbitrary configuration files.
+
+Instead:
+
+```
+AI
+ │
+ ▼
+Settings API
+ │
+ ▼
+Permission Check
+ │
+ ▼
+Validated Configuration Change
+
+```
+
+This allows the operating system to validate changes before applying them.
+
+---
+
+## 25. Application Architecture
+
+Aurora should support normal Linux applications.
+
+The goal is not to require every application to be rewritten for Aurora.
+
+Applications should continue using standard Linux technologies wherever possible.
+
+Aurora-specific functionality should be optional.
+
+```
+Standard Linux Application
+          │
+          ├── Standard Linux APIs
+          │
+          └── Optional Aurora APIs
+
+```
+
+This improves compatibility and reduces ecosystem fragmentation.
+
+---
+
+## 26. AI-Enabled Applications
+
+Applications that want AI capabilities can use the Aurora AI API.
+
+For example:
+
+```
+Text Editor
+     │
+     │ "Summarize document"
+     ▼
+Aurora AI Service
+     │
+     ▼
+Local Model
+     │
+     ▼
+Summary
+     │
+     ▼
+Text Editor
+
+```
+
+The application does not need to:
+
+- install a separate model;
+- manage GPU memory;
+- maintain an AI provider;
+- implement privacy settings independently.
+
+---
+
+## 27. Application Sandboxing
+
+Aurora should eventually support strong application isolation.
+
+Where practical, applications should have restricted access to:
+
+- files;
+- devices;
+- networking;
+- system services;
+- hardware.
+
+The architecture should make use of existing Linux security and sandboxing technologies rather than inventing a completely new isolation mechanism.
+
+---
+
+## 28. Package and Application Distribution
+
+Aurora should avoid creating a completely independent software ecosystem unnecessarily.
+
+The initial architecture should reuse the package ecosystem of the chosen Linux base.
+
+Potential layers:
+
+```
+Linux Distribution Packages
+          │
+          ▼
+Aurora Packages
+          │
+          ▼
+Aurora Applications
+
+```
+
+A future Aurora App Store can provide a user-friendly interface while relying on established underlying packaging and sandboxing mechanisms.
+
+---
+
+## 29. App Store Architecture
+
+The App Store is intentionally **not an MVP dependency**.
+
+Eventually it could provide:
+
+- application discovery;
+- installation;
+- updates;
+- removal;
+- permissions;
+- application metadata;
+- compatibility information;
+- security information.
+
+Conceptually:
+
+```
+Aurora App Store
+       │
+       ▼
+Application Metadata
+       │
+       ▼
+Package / Application Backend
+       │
+       ▼
+Sandboxed Application
+
+```
+
+The App Store should not become a mandatory replacement for every underlying Linux package-management mechanism unless there is a strong architectural reason.
+
+---
+
+## 30. System Service Management
+
+Aurora system services should be managed using the host Linux service-management infrastructure.
+
+A service should have:
+
+- a defined purpose;
+- clear dependencies;
+- minimal privileges;
+- resource limits;
+- logging;
+- restart behavior;
+- health monitoring;
+- configuration boundaries.
+
+For example:
+
+```
+systemd
+   │
+   ├── aurora-ai.service
+   ├── aurora-search.service
+   └── aurora-context.service
+
+```
+
+---
+
+## 31. Failure Isolation
+
+Aurora should assume that components will fail.
+
+Examples:
+
+```
+Model crashes
+      ↓
+Restart AI worker
+
+AI service crashes
+      ↓
+Restart AI service
+
+Aurora UI crashes
+      ↓
+Restart shell
+
+Search service crashes
+      ↓
+Search unavailable
+      ↓
+Rest of OS continues
+
+```
+
+A nonessential AI component should never be capable of taking down the entire desktop.
+
+---
+
+## 32. Security Architecture
+
+Security should follow defense in depth.
+
+```
+┌──────────────────────────────┐
+│ Application Isolation        │
+├──────────────────────────────┤
+│ Service Permissions           │
+├──────────────────────────────┤
+│ IPC Authorization             │
+├──────────────────────────────┤
+│ Linux Users / Groups          │
+├──────────────────────────────┤
+│ Sandboxing / MAC              │
+├──────────────────────────────┤
+│ Kernel Security               │
+├──────────────────────────────┤
+│ Hardware Security             │
+└──────────────────────────────┘
+
+```
+
+No single layer should be assumed to be sufficient.
+
+---
+
+## 33. AI Security Boundary
+
+The AI model itself should be considered **untrusted software**.
+
+This is an important architectural principle.
+
+A model can produce incorrect or maliciously influenced output.
+
+Therefore:
+
+```
+AI Output ≠ Authorization
+
+```
+
+A model saying:
+
+```
+"Delete the file."
+
+```
+
+must not automatically authorize deletion.
+
+The operating system must evaluate the requested action independently.
+
+---
+
+## 34. Privileged Operations
+
+Aurora should minimize privileged code.
+
+For example:
+
+```
+User Application
+      │
+      ▼
+Aurora API
+      │
+      ▼
+Policy Check
+      │
+      ▼
+Privileged Helper
+      │
+      ▼
+System Operation
+
+```
+
+The privileged helper should perform only the specific operation required.
+
+It should not become a general-purpose root shell.
+
+---
+
+## 35. Secrets
+
+AI services must not automatically receive access to:
+
+- passwords;
+- authentication tokens;
+- private keys;
+- browser credentials;
+- API keys.
+
+Secrets should be handled through appropriate operating-system credential mechanisms.
+
+If an AI-powered feature genuinely requires access to a secret, that access must be explicitly designed and permission-controlled.
+
+---
+
+## 36. Privacy Architecture
+
+Aurora's privacy model should distinguish between:
+
+### Local processing
+
+```
+User Data → Local Model → Result
+
+```
+
+### User-approved cloud processing
+
+```
+User Data
+    ↓
+Privacy Policy
+    ↓
+Cloud Provider
+    ↓
+Result
+
+```
+
+### Prohibited implicit behavior
+
+```
+User Data
+    ↓
+Cloud
+
+```
+
+without the user understanding that external processing is occurring.
+
+---
+
+## 37. Telemetry
+
+Aurora should not make invasive telemetry a requirement.
+
+If telemetry is introduced in the future, it should be:
+
+- documented;
+- minimized;
+- privacy-conscious;
+- configurable;
+- separated from AI functionality;
+- disabled by default where practical.
+
+Diagnostics needed for local system functionality should be distinguished from analytics collected for product development.
+
+---
+
+## 38. Resource Management
+
+AI introduces unusually high resource requirements.
+
+Aurora must eventually consider:
+
+- CPU usage;
+- RAM usage;
+- GPU usage;
+- VRAM usage;
+- storage;
+- battery consumption;
+- thermal conditions.
+
+The AI service should therefore eventually expose resource state such as:
+
+```
+Model:
+    Status: Ready
+    RAM: ...
+    VRAM: ...
+    GPU: ...
+    Estimated Power: ...
+
+```
+
+The exact metrics are implementation-dependent.
+
+---
+
+## 39. Hardware Adaptation
+
+Aurora should not assume every computer can run the same AI model.
+
+A future provider-selection system could consider:
+
+```
+Hardware
+   │
+   ├── CPU
+   ├── RAM
+   ├── GPU
+   ├── VRAM
+   └── Power State
+          │
+          ▼
+    Model Selection
+
+```
+
+For example:
+
+```
+Low-resource system
+       ↓
+Small model
+
+Powerful desktop
+       ↓
+Larger model
+
+No local acceleration
+       ↓
+CPU model / optional cloud
+
+```
+
+The application API remains unchanged.
+
+---
+
+## 40. Observability
+
+Aurora services should produce structured diagnostic information.
+
+Important categories include:
+
+- service state;
+- errors;
+- warnings;
+- performance;
+- resource usage;
+- request failures;
+- model loading;
+- permission denials.
+
+Logs should avoid accidentally recording sensitive AI prompts or personal data.
+
+---
+
+## 41. Configuration
+
+Aurora configuration should be separated into logical categories.
+
+```
+System Configuration
+       │
+       ├── Hardware
+       ├── Services
+       └── Security
+
+User Configuration
+       │
+       ├── Preferences
+       ├── AI settings
+       └── Applications
+
+AI Configuration
+       │
+       ├── Provider
+       ├── Model
+       └── Resource policy
+
+```
+
+Applications should not directly modify configuration belonging to other components.
+
+---
+
+## 42. Updates
+
+Aurora should rely heavily on the underlying Linux distribution's mature update infrastructure initially.
+
+Aurora-specific components should have a controlled update mechanism.
+
+Eventually:
+
+```
+Update Source
+      │
+      ▼
+Signature Verification
+      │
+      ▼
+Package Validation
+      │
+      ▼
+Installation
+      │
+      ▼
+Health Check
+
+```
+
+Updates should be authenticated and integrity-protected.
+
+---
+
+## 43. Compatibility Strategy
+
+Aurora should aim for compatibility at multiple levels.
+
+### Kernel compatibility
+
+Use standard Linux interfaces.
+
+### Userspace compatibility
+
+Use standard Linux libraries and conventions.
+
+### Application compatibility
+
+Avoid unnecessarily changing existing application interfaces.
+
+### AI compatibility
+
+Provide a stable Aurora AI API independent of the model implementation.
+
+This produces:
+
+```
+Stable Aurora Interface
+          │
+          ├── Model A
+          ├── Model B
+          ├── Model C
+          └── Cloud Provider
+
+```
+
+---
+
+## 44. Testing Architecture
+
+Aurora should be tested at several levels.
+
+### 44.1 Unit Tests
+
+Test individual components.
+
+Examples:
+
+- permission evaluation;
+- request validation;
+- model selection;
+- configuration parsing;
+- API serialization.
+
+---
+
+### 44.2 Integration Tests
+
+Test interactions between components.
+
+Examples:
+
+```
+Application
+    ↓
+D-Bus
+    ↓
+Aurora AI
+    ↓
+Mock Provider
+    ↓
+Response
+
+```
+
+---
+
+### 44.3 Security Tests
+
+Test:
+
+- unauthorized IPC calls;
+- privilege escalation attempts;
+- malformed requests;
+- malicious application behavior;
+- invalid tool requests;
+- sandbox escapes;
+- prompt-injection-related tool abuse.
+
+---
+
+### 44.4 Failure Tests
+
+Aurora should deliberately test failures.
+
+Examples:
+
+- kill AI worker;
+- disconnect network;
+- remove model;
+- exhaust available memory;
+- terminate system services;
+- corrupt configuration;
+- deny permissions.
+
+The expected result should be graceful degradation rather than system-wide failure.
+
+---
+
+## 45. Development Architecture
+
+During early development, Aurora should not immediately attempt to produce a complete installable operating system.
+
+Instead, development should proceed in layers.
+
+```
+Phase 1
+Aurora AI API prototype
+        ↓
+Phase 2
+Aurora AI daemon
+        ↓
+Phase 3
+IPC integration
+        ↓
+Phase 4
+Linux service integration
+        ↓
+Phase 5
+Desktop integration
+        ↓
+Phase 6
+Bootable Aurora environment
+        ↓
+Phase 7
+Installer / distribution
+
+```
+
+This allows architectural assumptions to be tested before the project becomes difficult to change.
+
+---
+
+## 46. Prototype Environment
+
+Early Aurora services should be capable of running on an ordinary Linux environment.
+
+The first objective is to prove:
+
+```
+Application
+     ↓
+IPC
+     ↓
+Aurora AI Service
+     ↓
+Model Provider
+     ↓
+Response
+
+```
+
+before attempting to create a complete distribution.
+
+This dramatically reduces development complexity.
+
+---
+
+## 47. Repository Architecture
+
+The repository should separate documentation, source code, tests, and build infrastructure.
+
+Initial structure:
+
+```
+aurora-os/
+│
+├── README.md
+├── LICENSE
+│
+├── docs/
+│   ├── architecture.md
+│   ├── mvp.md
+│   └── decisions/
+│       ├── README.md
+│       └── ...
+│
+├── src/
+│   ├── ai/
+│   ├── services/
+│   ├── desktop/
+│   └── ...
+│
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── security/
+│
+├── packaging/
+│
+└── .github/
+    └── workflows/
+
+```
+
+The exact source structure should evolve with implementation.
+
+---
+
+## 48. Dependency Philosophy
+
+Aurora should avoid unnecessary dependencies.
+
+Every significant dependency should be evaluated based on:
+
+- maintenance status;
+- license;
+- security history;
+- community health;
+- platform compatibility;
+- dependency size;
+- performance;
+- complexity;
+- availability of alternatives.
+
+A dependency should not be introduced merely because it is popular.
+
+---
+
+## 49. Programming Language Strategy
+
+Aurora does not require one language for every component.
+
+The language should match the problem.
+
+Potential considerations include:
+
+| Area | Possible language |
+|---|---|
+| Core system services | Rust / C++ |
+| Desktop components | Rust / existing toolkit language |
+| AI orchestration | Rust / Python depending on requirements |
+| ML experimentation | Python |
+| Performance-critical components | Rust / C / C++ |
+| Build tooling | Appropriate ecosystem tooling |
+| Scripts | Shell / Python where appropriate |
+
+The architecture should prioritize clear interfaces over enforcing a single language.
+
+For security-sensitive long-running services, memory-safe languages such as Rust should receive serious consideration.
+
+---
+
+## 50. AI Service Language Boundary
+
+The model runtime should not dictate the language of the rest of Aurora.
+
+For example:
+
+```
+Aurora AI Service
+       │
+       │ Stable API
+       ▼
+Model Runtime
+
+```
+
+The model runtime could be implemented in a different language or replaced entirely without changing application-facing APIs.
+
+---
+
+## 51. Architectural Non-Goals
+
+Aurora will **not** attempt to:
+
+- create a new kernel;
+- replace Linux's fundamental process model;
+- replace every existing Linux application;
+- build a new programming language;
+- train a frontier-scale AI model from scratch;
+- make every OS operation AI-controlled;
+- require cloud AI;
+- require proprietary AI services;
+- replace mature Linux infrastructure without justification;
+- put privileged system access directly into an AI model.
+
+These restrictions exist to keep the project focused.
+
+---
+
+## 52. Major Architectural Risks
+
+## Risk 1: AI Becomes Too Central
+
+If every system operation depends on the AI service, the service becomes a single point of failure.
+
+### Mitigation
+
+Keep deterministic OS functionality independent of AI.
+
+---
+
+## Risk 2: Excessive Permissions
+
+Giving the AI service broad system privileges could create catastrophic security consequences.
+
+### Mitigation
+
+Use explicit capabilities, authorization, sandboxing, and separate privileged helpers.
+
+---
+
+## Risk 3: Overengineering
+
+Building custom infrastructure for problems Linux already solves could dramatically increase maintenance requirements.
+
+### Mitigation
+
+Prefer existing Linux technologies.
+
+---
+
+## Risk 4: Model Lock-In
+
+Hard-coding one AI model could make the architecture obsolete when better models appear.
+
+### Mitigation
+
+Use a provider abstraction.
+
+---
+
+## Risk 5: Hardware Assumptions
+
+A large AI model may work on one machine but be unusable on another.
+
+### Mitigation
+
+Make model selection hardware- and resource-aware.
+
+---
+
+## Risk 6: Context Leakage
+
+Giving AI excessive access to user data could create privacy problems.
+
+### Mitigation
+
+Use explicit context providers and minimum-context principles.
+
+---
+
+## Risk 7: Prompt Injection
+
+Untrusted content could manipulate AI into requesting unsafe actions.
+
+### Mitigation
+
+Treat model output as untrusted and independently authorize every privileged action.
+
+---
+
+## 53. Architectural Invariants
+
+The following properties should remain true even as Aurora evolves.
+
+### Invariant 1
+
+**Aurora runs on the Linux kernel.**
+
+### Invariant 2
+
+**AI is a modular userspace service.**
+
+### Invariant 3
+
+**AI failure must not cause operating-system failure.**
+
+### Invariant 4
+
+**AI output is not equivalent to authorization.**
+
+### Invariant 5
+
+**Applications should not depend directly on a specific AI model.**
+
+### Invariant 6
+
+**Sensitive capabilities require explicit authorization.**
+
+### Invariant 7
+
+**Local processing should be preferred where practical.**
+
+### Invariant 8
+
+**Existing Linux infrastructure should be preferred over unnecessary custom infrastructure.**
+
+### Invariant 9
+
+**System interfaces should be documented and versioned.**
+
+### Invariant 10
+
+**Major architectural changes must be recorded as decisions.**
+
+---
+
+## 54. Evolution Strategy
+
+Aurora should evolve through increasingly capable layers.
+
+```
+                   Aurora OS
+                       │
+        ┌──────────────┴──────────────┐
+        │                             │
+   Linux Foundation            Aurora Services
+                                      │
+                          ┌───────────┴───────────┐
+                          │                       │
+                     AI Platform            Desktop Platform
+                          │                       │
+                   ┌──────┴──────┐         ┌──────┴──────┐
+                   │             │         │             │
+                Models         Tools     Shell          Apps
+
+```
+
+The architecture intentionally leaves room for future capabilities without requiring them in the first release.
+
+Potential future systems include:
+
+- system-wide semantic search;
+- AI-assisted file organization;
+- natural-language system configuration;
+- accessibility assistance;
+- workflow automation;
+- application interoperability;
+- local personal context;
+- AI-assisted system administration;
+- multimodal interaction;
+- voice interfaces;
+- intelligent notifications.
+
+These are future possibilities, not MVP requirements.
+
+---
+
+## 55. MVP Architecture
+
+The first implementation should be dramatically smaller than the long-term architecture.
+
+The MVP should aim to prove this:
+
+```
+┌─────────────────────────────┐
+│       Simple Linux Desktop  │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│       Aurora AI Client      │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│       Aurora AI Service     │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│       Model Provider        │
+└──────────────┬──────────────┘
+               │
+               ▼
+          Local Model
+
+```
+
+The MVP does **not** need:
+
+- a custom desktop environment;
+- an App Store;
+- dozens of AI features;
+- a custom package manager;
+- a custom kernel;
+- a large AI model;
+- advanced context management;
+- complex automation.
+
+The first architectural proof is simply:
+
+> **Can Aurora provide a useful AI capability as a secure, replaceable Linux system service?**
+
+---
+
+## 56. Architecture Decision Process
+
+Architecture decisions should be recorded in:
+
+```
+docs/decisions/
+
+```
+
+Each significant decision should document:
+
+1. Problem
+2. Context
+3. Alternatives
+4. Decision
+5. Reasoning
+6. Consequences
+7. Reconsideration criteria
+
+For example:
+
+```
+ADR-001: System IPC Mechanism
+ADR-002: Linux Base Distribution
+ADR-003: AI Provider Interface
+ADR-004: Model Isolation
+ADR-005: Application Sandboxing
+
+```
+
+Decisions should be revisited when new evidence justifies doing so.
+
+---
+
+## 57. What This Architecture Deliberately Does Not Decide Yet
+
+Some decisions should remain open until prototypes provide evidence.
+
+These include:
+
+- exact Linux base distribution;
+- exact desktop toolkit;
+- exact programming language for every service;
+- exact AI inference runtime;
+- exact AI model;
+- exact Aurora AI API schema;
+- exact packaging format for Aurora-specific components;
+- exact sandboxing technology;
+- exact App Store architecture;
+- exact context-storage implementation.
+
+This is intentional.
+
+A good architecture should constrain dangerous choices while leaving implementation details open until there is enough information to make them intelligently.
+
+---
+
+## 58. Final Architectural Model
+
+The intended long-term architecture can be summarized as:
+
+```
+                         USER
+                          │
+                          ▼
+                ┌───────────────────┐
+                │   Aurora Desktop  │
+                │      Shell        │
+                └─────────┬─────────┘
+                          │
+             ┌────────────┼────────────┐
+             │            │            │
+             ▼            ▼            ▼
+        Applications   Settings    System UI
+             │            │            │
+             └────────────┼────────────┘
+                          │
+                     Aurora APIs
+                          │
+        ┌─────────────────┼─────────────────┐
+        │                 │                 │
+        ▼                 ▼                 ▼
+   Aurora AI         Aurora Search     Other Services
+    Service
+        │
+        ├──────────────┐
+        │              │
+        ▼              ▼
+   Context Layer   Tool Layer
+        │              │
+        └───────┬──────┘
+                │
+                ▼
+       Policy / Permission
+                │
+                ▼
+       Model Provider API
+          │           │
+          ▼           ▼
+     Local Model   Cloud Model
+          │
+          ▼
+    Model Runtime
+          │
+          ▼
+   Linux Userspace
+          │
+          ▼
+    Linux Kernel
+          │
+          ▼
+       Hardware
+
+```
+
+The most important boundary is:
+
+```
+                AI
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ Policy Boundary │
+        └────────┬────────┘
+                 │
+                 ▼
+             OS Action
+
+```
+
+The AI can **request** an operation.
+
+The operating system decides whether that operation is **allowed**.
+
+---
+
+## 59. Architectural Goal
+
+Aurora should ultimately demonstrate that an operating system can treat AI as a **first-class system capability without turning the AI into a privileged, monolithic component**.
+
+The target architecture is therefore not:
+
+> "Linux with an AI chatbot installed."
+
+It is:
+
+> **Linux providing the foundation, Aurora providing an integrated system-services layer, and AI functioning as a controlled platform capability available throughout the operating system.**
+
+The architecture should remain understandable, testable, replaceable, and secure as Aurora grows.
+
+---
+
+**End of Architecture Document**
