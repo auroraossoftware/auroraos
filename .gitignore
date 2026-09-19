@@ -1,0 +1,7 @@
+# Rust build artifacts
+/target/
+
+# Python bytecode and caches
+**/__pycache__/
+*.pyc
+*.pyo

@@ -1,0 +1,9 @@
+[package]
+name = "aurora-ai"
+version = "0.1.0"
+edition = "2021"
+description = "Central system AI daemon for Aurora OS (lifecycle & supervision)"
+
+[dependencies]
+aurora-protocol = { path = "../aurora-protocol" }
+serde_json = "1.0"
