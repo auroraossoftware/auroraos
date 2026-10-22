@@ -89,9 +89,11 @@ pub struct WorkerSupervisor {
     config: SupervisorConfig,
     socket_path: PathBuf,
     child: Option<Child>,
-    stream: Option<UnixStream>,
+    reader: Option<BufReader<UnixStream>>,
+    writer: Option<UnixStream>,
     worker_version: Option<String>,
     dispatcher: CapabilityDispatcher,
+    turn_counter: u64,
 }
 
 impl WorkerSupervisor {
@@ -103,9 +105,11 @@ impl WorkerSupervisor {
             config,
             socket_path,
             child: None,
-            stream: None,
+            reader: None,
+            writer: None,
             worker_version: None,
             dispatcher,
+            turn_counter: 0,
         }
     }
 
@@ -116,10 +120,32 @@ impl WorkerSupervisor {
             config,
             socket_path,
             child: None,
-            stream: None,
+            reader: None,
+            writer: None,
             worker_version: None,
             dispatcher,
+            turn_counter: 0,
         }
+    }
+
+    /// Creates a supervisor attached to an already-connected UnixStream (useful for synthetic/mock testing).
+    pub fn from_stream(
+        config: SupervisorConfig,
+        dispatcher: CapabilityDispatcher,
+        stream: UnixStream,
+    ) -> Result<Self, SupervisorError> {
+        let writer = stream.try_clone().map_err(SupervisorError::Io)?;
+        let reader = BufReader::new(stream);
+        Ok(Self {
+            socket_path: config.socket_path.clone(),
+            config,
+            child: None,
+            reader: Some(reader),
+            writer: Some(writer),
+            worker_version: Some("0.1.0".to_string()),
+            dispatcher,
+            turn_counter: 0,
+        })
     }
 
     /// Returns a reference to the supervisor's policy engine.
@@ -221,9 +247,12 @@ impl WorkerSupervisor {
             .map_err(SupervisorError::Io)?;
 
         // Step 5: Execute protocol handshake
-        let worker_version = self.execute_handshake(&stream)?;
+        let mut writer = stream.try_clone().map_err(SupervisorError::Io)?;
+        let mut reader = BufReader::new(stream);
+        let worker_version = Self::execute_handshake_on_channels(&mut writer, &mut reader)?;
         self.worker_version = Some(worker_version);
-        self.stream = Some(stream);
+        self.writer = Some(writer);
+        self.reader = Some(reader);
 
         Ok(())
     }
@@ -254,17 +283,17 @@ impl WorkerSupervisor {
         }
     }
 
-    /// Executes the initial handshake exchange over the connected stream.
-    fn execute_handshake(&self, stream: &UnixStream) -> Result<String, SupervisorError> {
-        let mut writer = stream.try_clone().map_err(SupervisorError::Io)?;
-        let mut reader = BufReader::new(stream.try_clone().map_err(SupervisorError::Io)?);
-
+    /// Executes the initial handshake exchange over the connected channels.
+    fn execute_handshake_on_channels(
+        writer: &mut UnixStream,
+        reader: &mut BufReader<UnixStream>,
+    ) -> Result<String, SupervisorError> {
         // Send Handshake
         let handshake_msg = DaemonToWorkerMessage::Handshake(Handshake::new("0.1.0"));
-        send_daemon_message(&mut writer, &handshake_msg)?;
+        send_daemon_message(writer, &handshake_msg)?;
 
         // Read HandshakeResponse
-        let response = read_worker_message(&mut reader)?
+        let response = read_worker_message(reader)?
             .ok_or(SupervisorError::HandshakeRejected("EOF before handshake response".to_string()))?;
 
         match response {
@@ -288,11 +317,131 @@ impl WorkerSupervisor {
         }
     }
 
+    /// Executes a complete reasoning turn end-to-end with the supervised worker.
+    ///
+    /// Request flow:
+    /// 1. Establishes a unique turn_id and transmits `RequestTurn` to worker.
+    /// 2. Reads untrusted worker messages across private IPC.
+    /// 3. Validates capability proposal (`ProposeCapability`) and enforces deterministic policy.
+    /// 4. If allowed, invokes `CapabilityDispatcher` to execute capability provider.
+    /// 5. Delivers structured `CapabilityResult` back to worker.
+    /// 6. Reads final `CompleteTurn` from worker and returns it to caller.
+    pub fn execute_turn(
+        &mut self,
+        caller: &CallerIdentity,
+        prompt: &str,
+    ) -> Result<aurora_protocol::CompleteTurn, SupervisorError> {
+        self.turn_counter += 1;
+        let turn_id = format!("turn-{}", self.turn_counter);
+        self.execute_turn_with_id(caller, &turn_id, prompt)
+    }
+
+    /// Executes a reasoning turn with an explicit turn ID.
+    pub fn execute_turn_with_id(
+        &mut self,
+        caller: &CallerIdentity,
+        turn_id: &str,
+        prompt: &str,
+    ) -> Result<aurora_protocol::CompleteTurn, SupervisorError> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or(SupervisorError::Ipc(IpcError::ConnectionClosed))?;
+
+        // Construct RequestTurn message with registered available capabilities
+        let available_capabilities = vec![
+            aurora_protocol::CapabilitySchema {
+                name: "sys.cpu.read".to_string(),
+                description: "Reads host CPU telemetry metrics".to_string(),
+                parameters_schema: serde_json::json!({}),
+            },
+            aurora_protocol::CapabilitySchema {
+                name: "sys.memory.read".to_string(),
+                description: "Reads host memory telemetry metrics".to_string(),
+                parameters_schema: serde_json::json!({}),
+            },
+        ];
+
+        let request = aurora_protocol::RequestTurn {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            turn_id: turn_id.to_string(),
+            prompt: prompt.to_string(),
+            available_capabilities,
+        };
+
+        send_daemon_message(writer, &DaemonToWorkerMessage::RequestTurn(request))?;
+
+        loop {
+            let res = {
+                let reader = self
+                    .reader
+                    .as_mut()
+                    .ok_or(SupervisorError::Ipc(IpcError::ConnectionClosed))?;
+                read_worker_message(reader)
+            };
+
+            let msg = match res {
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    self.reader = None;
+                    self.writer = None;
+                    return Err(SupervisorError::Ipc(IpcError::ConnectionClosed));
+                }
+                Err(e) => {
+                    self.reader = None;
+                    self.writer = None;
+                    return Err(SupervisorError::Ipc(e));
+                }
+            };
+
+            match msg {
+                WorkerToDaemonMessage::ProposeCapability(proposal) => {
+                    if proposal.turn_id != turn_id {
+                        return Err(SupervisorError::UnexpectedMessage(format!(
+                            "Turn ID mismatch in proposal: expected '{turn_id}', got '{}'",
+                            proposal.turn_id
+                        )));
+                    }
+
+                    // Enforce deterministic policy and execute capability provider strictly if authorized
+                    let outcome = self.dispatcher.execute_proposal(caller, &proposal);
+
+                    // Deliver CapabilityResult back to worker
+                    let writer = self
+                        .writer
+                        .as_mut()
+                        .ok_or(SupervisorError::Ipc(IpcError::ConnectionClosed))?;
+                    send_daemon_message(writer, &DaemonToWorkerMessage::CapabilityResult(outcome))?;
+                }
+                WorkerToDaemonMessage::CompleteTurn(complete_turn) => {
+                    if complete_turn.turn_id != turn_id {
+                        return Err(SupervisorError::UnexpectedMessage(format!(
+                            "Turn ID mismatch in complete_turn: expected '{turn_id}', got '{}'",
+                            complete_turn.turn_id
+                        )));
+                    }
+                    complete_turn
+                        .validate()
+                        .map_err(|e| SupervisorError::UnexpectedMessage(e.to_string()))?;
+                    return Ok(complete_turn);
+                }
+                WorkerToDaemonMessage::HandshakeResponse(_) => {
+                    return Err(SupervisorError::UnexpectedMessage(
+                        "Unexpected HandshakeResponse during active turn".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     /// Polls the health of the worker child process.
     pub fn poll_status(&mut self) -> Result<WorkerStatus, SupervisorError> {
         if let Some(ref mut child) = self.child {
             if let Some(status) = child.try_wait().map_err(SupervisorError::Io)? {
                 return Ok(WorkerStatus::Terminated(status.code()));
+            }
+            if self.writer.is_none() || self.reader.is_none() {
+                return Ok(WorkerStatus::Disconnected);
             }
             Ok(WorkerStatus::Running)
         } else {
@@ -302,8 +451,9 @@ impl WorkerSupervisor {
 
     /// Cleanly terminates the worker process and unlinks the Unix socket file.
     pub fn shutdown(&mut self) {
-        // Drop stream to signal EOF to child
-        self.stream = None;
+        // Drop stream channels to signal EOF to child
+        self.reader = None;
+        self.writer = None;
 
         // Terminate child process if still running
         if let Some(mut child) = self.child.take() {

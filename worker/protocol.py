@@ -103,6 +103,22 @@ class RequestTurn:
             available_capabilities=caps,
         )
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": "request_turn",
+            "protocol_version": self.protocol_version,
+            "turn_id": self.turn_id,
+            "prompt": self.prompt,
+            "available_capabilities": [
+                {
+                    "name": c.name,
+                    "description": c.description,
+                    "parameters_schema": c.parameters_schema,
+                }
+                for c in self.available_capabilities
+            ],
+        }
+
 
 @dataclass
 class ProposeCapability:
@@ -122,8 +138,9 @@ class ProposeCapability:
         if not self.capability_name or not CAPABILITY_NAME_PATTERN.match(self.capability_name):
             raise ProtocolValidationError(f"Invalid capability name: '{self.capability_name}'")
 
-    def to_dict(self) -> Dict[str, Any]:
-        self.validate()
+    def to_dict(self, validate: bool = True) -> Dict[str, Any]:
+        if validate:
+            self.validate()
         return {
             "type": "propose_capability",
             "protocol_version": self.protocol_version,
@@ -186,8 +203,9 @@ class CompleteTurn:
         if self.status not in ("success", "error"):
             raise ProtocolValidationError(f"Invalid turn status: {self.status}")
 
-    def to_dict(self) -> Dict[str, Any]:
-        self.validate()
+    def to_dict(self, validate: bool = True) -> Dict[str, Any]:
+        if validate:
+            self.validate()
         return {
             "type": "complete_turn",
             "protocol_version": self.protocol_version,
@@ -195,3 +213,13 @@ class CompleteTurn:
             "status": self.status,
             "response_text": self.response_text,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> CompleteTurn:
+        return cls(
+            protocol_version=data.get("protocol_version", CURRENT_PROTOCOL_VERSION),
+            turn_id=data.get("turn_id", ""),
+            status=data.get("status", "unknown"),
+            response_text=data.get("response_text", ""),
+        )
+

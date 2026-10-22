@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use crate::identity::CallerIdentity;
 use crate::policy::{PolicyDecision, PolicyEngine};
-use crate::provider::{CpuProvider, LinuxProcStatCpuProvider};
+use crate::provider::{
+    CpuProvider, LinuxProcMeminfoMemoryProvider, LinuxProcStatCpuProvider, MemoryProvider,
+};
 use aurora_protocol::{
     CapabilityError, CapabilityOutcome, CapabilityResult, CURRENT_PROTOCOL_VERSION,
     ProposeCapability,
@@ -21,6 +23,7 @@ use aurora_protocol::{
 pub struct CapabilityDispatcher {
     policy_engine: PolicyEngine,
     cpu_provider: Arc<dyn CpuProvider>,
+    memory_provider: Arc<dyn MemoryProvider>,
 }
 
 impl CapabilityDispatcher {
@@ -29,14 +32,35 @@ impl CapabilityDispatcher {
         Self {
             policy_engine,
             cpu_provider,
+            memory_provider: Arc::new(LinuxProcMeminfoMemoryProvider::new()),
         }
     }
 
-    /// Creates a default dispatcher with MVP policy configuration and Linux `/proc/stat` CPU provider.
+    /// Attaches a custom memory provider (useful for testing with mock providers).
+    pub fn with_memory_provider(mut self, memory_provider: Arc<dyn MemoryProvider>) -> Self {
+        self.memory_provider = memory_provider;
+        self
+    }
+
+    /// Creates a dispatcher with explicit policy engine, CPU provider, and memory provider.
+    pub fn new_with_providers(
+        policy_engine: PolicyEngine,
+        cpu_provider: Arc<dyn CpuProvider>,
+        memory_provider: Arc<dyn MemoryProvider>,
+    ) -> Self {
+        Self {
+            policy_engine,
+            cpu_provider,
+            memory_provider,
+        }
+    }
+
+    /// Creates a default dispatcher with MVP policy configuration and Linux telemetry providers.
     pub fn new_default(sandbox_root: PathBuf) -> Self {
-        Self::new(
+        Self::new_with_providers(
             PolicyEngine::new_mvp(sandbox_root),
             Arc::new(LinuxProcStatCpuProvider::new()),
+            Arc::new(LinuxProcMeminfoMemoryProvider::new()),
         )
     }
 
@@ -53,6 +77,11 @@ impl CapabilityDispatcher {
     /// Access the CPU provider.
     pub fn cpu_provider(&self) -> &Arc<dyn CpuProvider> {
         &self.cpu_provider
+    }
+
+    /// Access the memory provider.
+    pub fn memory_provider(&self) -> &Arc<dyn MemoryProvider> {
+        &self.memory_provider
     }
 
     /// Evaluates a proposal against policy without executing the capability.
@@ -137,6 +166,25 @@ impl CapabilityDispatcher {
                             },
                         },
                     },
+                    "sys.memory.read" => match self.memory_provider.read_memory() {
+                        Ok(data) => CapabilityResult {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            turn_id: proposal.turn_id.clone(),
+                            call_id: proposal.call_id.clone(),
+                            outcome: CapabilityOutcome::Success { data },
+                        },
+                        Err(err) => CapabilityResult {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            turn_id: proposal.turn_id.clone(),
+                            call_id: proposal.call_id.clone(),
+                            outcome: CapabilityOutcome::Failure {
+                                error: CapabilityError {
+                                    code: err.code,
+                                    message: err.message,
+                                },
+                            },
+                        },
+                    },
                     unimplemented => CapabilityResult {
                         protocol_version: CURRENT_PROTOCOL_VERSION,
                         turn_id: proposal.turn_id.clone(),
@@ -145,7 +193,7 @@ impl CapabilityDispatcher {
                             error: CapabilityError {
                                 code: "NOT_IMPLEMENTED".to_string(),
                                 message: format!(
-                                    "Capability '{unimplemented}' is not implemented in Milestone 4"
+                                    "Capability '{unimplemented}' is not implemented"
                                 ),
                             },
                         },

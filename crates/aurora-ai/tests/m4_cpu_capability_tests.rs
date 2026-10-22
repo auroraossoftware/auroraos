@@ -328,21 +328,21 @@ fn test_supervisor_enforces_authorization_before_execution() {
 fn test_unimplemented_capabilities_return_not_implemented() {
     let caller = CallerIdentity::principal("client-app");
     let mut policy = PolicyEngine::new_mvp(PathBuf::from("/tmp/sandbox"));
-    // Even if granted in policy, M4 has no provider for sys.memory.read
-    policy.grant(caller.clone(), "sys.memory.read");
+    // Even if granted in policy, proc.list is not implemented until M6b
+    policy.grant(caller.clone(), "proc.list");
 
     let mock_provider = Arc::new(MockCpuProvider::with_success(serde_json::json!({})));
     let dispatcher = CapabilityDispatcher::new(policy, mock_provider.clone());
 
-    let memory_proposal = ProposeCapability {
+    let proc_proposal = ProposeCapability {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         turn_id: "turn-m4-003".to_string(),
-        call_id: "call-mem-001".to_string(),
-        capability_name: "sys.memory.read".to_string(),
+        call_id: "call-proc-001".to_string(),
+        capability_name: "proc.list".to_string(),
         parameters: serde_json::json!({}),
     };
 
-    let result = dispatcher.execute_proposal(&caller, &memory_proposal);
+    let result = dispatcher.execute_proposal(&caller, &proc_proposal);
 
     // CPU provider is NOT touched
     assert_eq!(mock_provider.invocation_count(), 0);
@@ -350,8 +350,8 @@ fn test_unimplemented_capabilities_return_not_implemented() {
     match result.outcome {
         CapabilityOutcome::Failure { error } => {
             assert_eq!(error.code, "NOT_IMPLEMENTED");
-            assert!(error.message.contains("not implemented in Milestone 4"));
+            assert!(error.message.contains("not implemented"));
         }
-        CapabilityOutcome::Success { .. } => panic!("sys.memory.read unexpectedly succeeded in M4"),
+        CapabilityOutcome::Success { .. } => panic!("proc.list unexpectedly succeeded"),
     }
 }

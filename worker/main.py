@@ -19,11 +19,145 @@ from typing import Optional
 
 from worker.protocol import (
     CURRENT_PROTOCOL_VERSION,
+    CapabilityResult,
+    CompleteTurn,
     Handshake,
     HandshakeResponse,
+    ProposeCapability,
+    RequestTurn,
 )
 
 WORKER_VERSION = "0.1.0"
+
+
+def handle_request_turn(sock_file, req_data: dict) -> None:
+    """Handles an incoming RequestTurn message deterministically for M5."""
+    turn_id = req_data.get("turn_id", "")
+    prompt = req_data.get("prompt", "")
+
+    # Test seams for negative testing
+    if "simulate_crash" in prompt:
+        # Simulate worker crash / abnormal exit
+        sys.exit(137)
+
+    if "invalid_proposal_name" in prompt:
+        # Propose capability with invalid name syntax
+        prop_payload = {
+            "type": "propose_capability",
+            "protocol_version": CURRENT_PROTOCOL_VERSION,
+            "turn_id": turn_id,
+            "call_id": "call-err-01",
+            "capability_name": "sys..cpu.read",
+            "parameters": {},
+        }
+        sock_file.write(json.dumps(prop_payload) + "\n")
+        sock_file.flush()
+    elif "invalid_params" in prompt:
+        cap_name = "sys.memory.read" if "memory" in prompt else "sys.cpu.read"
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-err-02",
+            capability_name=cap_name,
+            parameters={"unexpected_extra": 123},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
+    elif "unknown_capability" in prompt:
+        # Propose an unknown capability
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-err-03",
+            capability_name="sys.quantum_core.read",
+            parameters={},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
+    elif "noop" in prompt or "direct_reply" in prompt:
+        # Direct reply without capability proposal
+        complete = CompleteTurn(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            status="success",
+            response_text="Direct worker response without capability invocation.",
+        )
+        sock_file.write(json.dumps(complete.to_dict()) + "\n")
+        sock_file.flush()
+        return
+    elif "memory" in prompt:
+        # Deterministic M6a behavior: propose sys.memory.read
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-mem-01",
+            capability_name="sys.memory.read",
+            parameters={},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
+    else:
+        # Default behavior: propose sys.cpu.read
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-cpu-01",
+            capability_name="sys.cpu.read",
+            parameters={},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
+
+    # Await CapabilityResult from daemon
+    res_line = sock_file.readline()
+    if not res_line:
+        print("[worker] Daemon closed connection before capability result", file=sys.stderr)
+        return
+
+    try:
+        res_data = json.loads(res_line.strip())
+    except json.JSONDecodeError as e:
+        print(f"[worker] Malformed capability result JSON: {e}", file=sys.stderr)
+        return
+
+    if res_data.get("type") != "capability_result":
+        print(f"[worker] Expected capability_result, got: {res_data.get('type')}", file=sys.stderr)
+        return
+
+    result = CapabilityResult.from_dict(res_data)
+    if result.status == "success":
+        data = result.data or {}
+        total_mb = data.get("total_mb")
+        used_mb = data.get("used_mb")
+        free_mb = data.get("free_mb")
+        available_mb = data.get("available_mb")
+
+        user = data.get("user_percent")
+        system = data.get("system_percent")
+        idle = data.get("idle_percent")
+
+        if total_mb is not None and available_mb is not None:
+            response_text = f"Host memory metrics: total={total_mb}MB, used={used_mb}MB, free={free_mb}MB, available={available_mb}MB"
+        elif user is not None and idle is not None:
+            response_text = f"Host CPU metrics: user={user}%, system={system}%, idle={idle}%"
+        else:
+            response_text = f"Capability executed successfully: {json.dumps(data)}"
+        turn_status = "success"
+    else:
+        err = result.error
+        code = err.code if err else "UNKNOWN"
+        msg = err.message if err else "Unknown capability error"
+        response_text = f"Capability execution failed: [{code}] {msg}"
+        turn_status = "error"
+
+    complete = CompleteTurn(
+        protocol_version=CURRENT_PROTOCOL_VERSION,
+        turn_id=turn_id,
+        status=turn_status,
+        response_text=response_text,
+    )
+    sock_file.write(json.dumps(complete.to_dict()) + "\n")
+    sock_file.flush()
 
 
 def run_worker(
@@ -88,13 +222,27 @@ def run_worker(
         sock_file.flush()
 
         # Step 4: Event loop - wait for daemon instructions or EOF
-        # In M2, no capabilities or turns are executed yet; we simply remain alive
-        # until the socket is closed or the process receives a termination signal.
         while True:
             line = sock_file.readline()
             if not line:
                 # Daemon closed socket (normal shutdown)
                 break
+
+            line_str = line.strip()
+            if not line_str:
+                continue
+
+            try:
+                msg_data = json.loads(line_str)
+            except json.JSONDecodeError as e:
+                print(f"[worker] Malformed JSON received from daemon: {e}", file=sys.stderr)
+                continue
+
+            msg_type = msg_data.get("type")
+            if msg_type == "request_turn":
+                handle_request_turn(sock_file, msg_data)
+            else:
+                print(f"[worker] Unexpected message type: {msg_type}", file=sys.stderr)
 
         return 0
 
@@ -112,7 +260,7 @@ def run_worker(
 def main(args: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aurora-worker",
-        description="Aurora OS AI Worker Stub (M2 Lifecycle)",
+        description="Aurora OS AI Worker Stub (M5 Vertical Slice)",
     )
     parser.add_argument(
         "--socket-path",

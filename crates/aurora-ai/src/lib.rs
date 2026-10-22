@@ -21,8 +21,9 @@ pub use dispatcher::CapabilityDispatcher;
 pub use identity::CallerIdentity;
 pub use policy::{PolicyDecision, PolicyEngine};
 pub use provider::{
-    parse_proc_stat, CapabilityExecutionError, CpuProvider, LinuxProcStatCpuProvider,
-    MockCpuProvider,
+    parse_proc_meminfo, parse_proc_stat, CapabilityExecutionError, CpuProvider,
+    LinuxProcMeminfoMemoryProvider, LinuxProcStatCpuProvider, MemoryProvider, MockCpuProvider,
+    MockMemoryProvider,
 };
 pub use supervisor::{SupervisorError, WorkerStatus, WorkerSupervisor};
 
