@@ -245,20 +245,73 @@ impl MemoryProvider for LinuxProcMeminfoMemoryProvider {
 
 /// Parses memory metrics from a `/proc/meminfo` formatted string.
 ///
-/// Extracts `MemTotal`, `MemFree`, and `MemAvailable` (or falls back to `MemFree` if `MemAvailable` is absent),
-/// and calculates total, used, free, and available memory in megabytes (MB).
+/// # Field Naming and Unit Conventions
+/// Linux `/proc/meminfo` expresses memory in units labeled `kB` (where 1 kB = 1024 bytes, i.e. kibibytes).
+/// Dividing by 1024 converts these values into binary mebibytes (MiB = 1024 * 1024 bytes).
+/// The public JSON schema fields (`total_mb`, `used_mb`, `free_mb`, `available_mb`) retain the `_mb`
+/// suffix for backwards compatibility with the MVP capability specification in `docs/vertical-slice-prototype-design.md`,
+/// but represent binary mebibytes (MiB). Renaming to `_mib` would break the established protocol contracts
+/// across supervisor, worker, and existing test suites.
+///
+/// # Calculation and Fallback Semantics
+/// - `used_mb` is computed as `total_mb.saturating_sub(available_mb)`. This is an estimate of memory
+///   actively consumed by user and system processes (analogous to the calculation used by modern `free`),
+///   not a direct hardware counter or raw kernel page allocation measurement.
+/// - If `MemAvailable` is absent (supported in Linux kernel >= 3.14), the parser falls back to `MemFree`.
+///   This fallback is a conservative lower-bound approximation (counting only completely unallocated pages
+///   and ignoring reclaimable buffer/cache memory) and is NOT equivalent to modern available-memory semantics.
+///
+/// # Validation and Error Handling
+/// - Missing `MemTotal` or `MemFree` produces a `PARSE_ERROR`.
+/// - Duplicate entries for `MemTotal`, `MemFree`, or `MemAvailable` produce a `PARSE_ERROR`.
+/// - Malformed numeric values or unexpected unit labels produce a `PARSE_ERROR`.
+/// - Inconsistent states (such as `MemTotal == 0`, `MemFree > MemTotal`, or `MemAvailable > MemTotal`)
+///   produce an explicit `PARSE_ERROR` to prevent misleading telemetry.
 pub fn parse_proc_meminfo(content: &str) -> Result<serde_json::Value, CapabilityExecutionError> {
     let mut mem_total_kb: Option<u64> = None;
     let mut mem_free_kb: Option<u64> = None;
     let mut mem_available_kb: Option<u64> = None;
 
     for line in content.lines() {
-        if line.starts_with("MemTotal:") {
-            mem_total_kb = parse_meminfo_kb(line);
-        } else if line.starts_with("MemFree:") {
-            mem_free_kb = parse_meminfo_kb(line);
-        } else if line.starts_with("MemAvailable:") {
-            mem_available_kb = parse_meminfo_kb(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some((key, rest)) = trimmed.split_once(':') {
+            let key = key.trim();
+            match key {
+                "MemTotal" => {
+                    if mem_total_kb.is_some() {
+                        return Err(CapabilityExecutionError::new(
+                            "PARSE_ERROR",
+                            "Duplicate 'MemTotal' field in meminfo source",
+                        ));
+                    }
+                    mem_total_kb = Some(parse_meminfo_value(key, rest)?);
+                }
+                "MemFree" => {
+                    if mem_free_kb.is_some() {
+                        return Err(CapabilityExecutionError::new(
+                            "PARSE_ERROR",
+                            "Duplicate 'MemFree' field in meminfo source",
+                        ));
+                    }
+                    mem_free_kb = Some(parse_meminfo_value(key, rest)?);
+                }
+                "MemAvailable" => {
+                    if mem_available_kb.is_some() {
+                        return Err(CapabilityExecutionError::new(
+                            "PARSE_ERROR",
+                            "Duplicate 'MemAvailable' field in meminfo source",
+                        ));
+                    }
+                    mem_available_kb = Some(parse_meminfo_value(key, rest)?);
+                }
+                _ => {
+                    // Other fields (Buffers, Cached, SwapTotal, etc.) are safely ignored
+                }
+            }
         }
     }
 
@@ -266,12 +319,38 @@ pub fn parse_proc_meminfo(content: &str) -> Result<serde_json::Value, Capability
         CapabilityExecutionError::new("PARSE_ERROR", "Missing 'MemTotal' line in meminfo source")
     })?;
 
+    if total_kb == 0 {
+        return Err(CapabilityExecutionError::new(
+            "PARSE_ERROR",
+            "Invalid meminfo: MemTotal cannot be zero",
+        ));
+    }
+
     let free_kb = mem_free_kb.ok_or_else(|| {
         CapabilityExecutionError::new("PARSE_ERROR", "Missing 'MemFree' line in meminfo source")
     })?;
 
+    if free_kb > total_kb {
+        return Err(CapabilityExecutionError::new(
+            "PARSE_ERROR",
+            "Invalid meminfo: MemFree cannot exceed MemTotal",
+        ));
+    }
+
+    if let Some(available_kb) = mem_available_kb {
+        if available_kb > total_kb {
+            return Err(CapabilityExecutionError::new(
+                "PARSE_ERROR",
+                "Invalid meminfo: MemAvailable cannot exceed MemTotal",
+            ));
+        }
+    }
+
+    // Fallback when MemAvailable is absent (Linux kernels < 3.14):
+    // Documented approximation using MemFree.
     let available_kb = mem_available_kb.unwrap_or(free_kb);
 
+    // Binary mebibytes (MiB):
     let total_mb = total_kb / 1024;
     let free_mb = free_kb / 1024;
     let available_mb = available_kb / 1024;
@@ -285,11 +364,32 @@ pub fn parse_proc_meminfo(content: &str) -> Result<serde_json::Value, Capability
     }))
 }
 
-fn parse_meminfo_kb(line: &str) -> Option<u64> {
-    let mut parts = line.split_whitespace();
-    let _prefix = parts.next()?;
-    let value_str = parts.next()?;
-    value_str.parse::<u64>().ok()
+fn parse_meminfo_value(field_name: &str, rest: &str) -> Result<u64, CapabilityExecutionError> {
+    let mut parts = rest.split_whitespace();
+    let num_str = parts.next().ok_or_else(|| {
+        CapabilityExecutionError::new(
+            "PARSE_ERROR",
+            format!("Missing numeric value for '{field_name}' in meminfo source"),
+        )
+    })?;
+
+    let val = num_str.parse::<u64>().map_err(|_| {
+        CapabilityExecutionError::new(
+            "PARSE_ERROR",
+            format!("Invalid numeric value '{num_str}' for '{field_name}' in meminfo source"),
+        )
+    })?;
+
+    if let Some(unit) = parts.next() {
+        if unit != "kB" {
+            return Err(CapabilityExecutionError::new(
+                "PARSE_ERROR",
+                format!("Unexpected unit '{unit}' for '{field_name}' in meminfo source (expected 'kB')"),
+            ));
+        }
+    }
+
+    Ok(val)
 }
 
 /// Mock implementation of `MemoryProvider` for deterministic testing.
@@ -425,5 +525,88 @@ mod tests {
 
         let _ = mock.read_memory();
         assert_eq!(mock.invocation_count(), 2);
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_colon_without_whitespace() {
+        let sample = "MemTotal:16377436 kB\nMemFree:2962928 kB\nMemAvailable:14088084 kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["total_mb"], 15993);
+        assert_eq!(val["free_mb"], 2893);
+        assert_eq!(val["available_mb"], 13757);
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_duplicate_fields() {
+        let sample = "MemTotal: 8388608 kB\nMemTotal: 4194304 kB\nMemFree: 2097152 kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "PARSE_ERROR");
+        assert!(err.message.contains("Duplicate 'MemTotal'"));
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_malformed_numeric() {
+        let sample = "MemTotal: notanumber kB\nMemFree: 2097152 kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "PARSE_ERROR");
+        assert!(err.message.contains("Invalid numeric value"));
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_unexpected_unit() {
+        let sample = "MemTotal: 8388608 MB\nMemFree: 2097152 kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "PARSE_ERROR");
+        assert!(err.message.contains("Unexpected unit 'MB'"));
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_zero_total_memory() {
+        let sample = "MemTotal: 0 kB\nMemFree: 0 kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "PARSE_ERROR");
+        assert!(err.message.contains("MemTotal cannot be zero"));
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_free_exceeds_total() {
+        let sample = "MemTotal: 1048576 kB\nMemFree: 2097152 kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "PARSE_ERROR");
+        assert!(err.message.contains("MemFree cannot exceed MemTotal"));
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_available_exceeds_total() {
+        let sample = "MemTotal: 1048576 kB\nMemFree: 524288 kB\nMemAvailable: 2097152 kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "PARSE_ERROR");
+        assert!(err.message.contains("MemAvailable cannot exceed MemTotal"));
+    }
+
+    #[test]
+    fn test_parse_proc_meminfo_malformed_available_does_not_silently_fallback() {
+        // If MemAvailable is present but corrupt, it must FAIL with PARSE_ERROR,
+        // rather than silently masking corruption and falling back to MemFree.
+        let sample = "MemTotal: 8388608 kB\nMemFree: 2097152 kB\nMemAvailable: corrupt_data kB\n";
+        let result = parse_proc_meminfo(sample);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "PARSE_ERROR");
+        assert!(err.message.contains("Invalid numeric value"));
     }
 }

@@ -153,12 +153,13 @@ The milestones documented below track prototype implementation progress against 
 * **Purpose:** Implement and integrate the second concrete capability provider (`sys.memory.read`) through the existing policy engine, capability dispatcher, and untrusted worker request flow.
 * **Main Deliverables:**
   * `MemoryProvider` trait in `crates/aurora-ai/src/provider.rs`: abstraction for memory metric queries with mock implementation (`MockMemoryProvider`) for deterministic test assertions.
-  * `LinuxProcMeminfoMemoryProvider`: prototype provider parsing `/proc/meminfo` lines (`MemTotal`, `MemFree`, `MemAvailable`), computing metrics in MB (`total_mb`, `used_mb`, `free_mb`, `available_mb`), with fallback logic when `MemAvailable` is absent.
+  * `LinuxProcMeminfoMemoryProvider`: prototype provider parsing `/proc/meminfo` lines (`MemTotal`, `MemFree`, `MemAvailable`), computing metrics in binary MiB (`total_mb`, `used_mb`, `free_mb`, `available_mb`, retaining `_mb` field names for protocol compatibility). Explicitly validates against duplicate fields, unexpected units, malformed values, and zero totals. Documented fallback logic when `MemAvailable` is absent (kernels < 3.14) as a lower-bound approximation, and `used_mb` as an estimate (`total - available`).
   * Dispatcher integration in `crates/aurora-ai/src/dispatcher.rs`: wired `sys.memory.read` through `PolicyEngine` pre-authorization check; denied proposals never execute the provider.
   * Worker stub integration in `worker/main.py`: handles prompts requesting memory metrics ("memory", "ram"), formats structured response upon success.
   * CLI flag support in `crates/aurora-ai/src/main.rs`: permits `--request "check memory"` for authorized runs.
+  * Architectural & Isolation Boundary Qualification: Operating-system-level confinement of the worker (e.g. seccomp, namespaces, Landlock) is not yet active; the worker process is an ordinary unprivileged child process and can read world-readable `/proc` files at the OS level. Isolation and policy enforcement for capability execution are strictly mediated at the application/protocol level by the daemon.
 * **Verification Performed:**
-  * Unit tests in `crates/aurora-ai/src/provider.rs`: proc meminfo parsing, unit conversion (kB to MB), missing field validation, and mock invocation counting.
+  * Unit tests in `crates/aurora-ai/src/provider.rs`: proc meminfo parsing, unit conversion (kB to MiB), duplicate field rejection, malformed value rejection, unexpected unit rejection, missing field validation, and mock invocation counting.
   * Integration tests in `crates/aurora-ai/tests/m6a_memory_capability_tests.rs` (10 tests):
     1. Authorized proposal succeeds with structured telemetry.
     2. Unauthorized proposal denied with `PERMISSION_DENIED` and provider count 0.
@@ -171,7 +172,7 @@ The milestones documented below track prototype implementation progress against 
     9. Unauthorized end-to-end flow denied with provider invocation count 0.
     10. Real host telemetry end-to-end execution.
   * Python unit & integration tests in `worker/test_worker.py`: memory prompt synthesis and response validation.
-  * Full regression run: 86 Rust tests + 13 Python tests passing.
+  * Full regression run: 94 Rust tests + 13 Python tests passing.
 * **Relevant Code:**
   * Provider: `crates/aurora-ai/src/provider.rs`
   * Dispatcher: `crates/aurora-ai/src/dispatcher.rs`
