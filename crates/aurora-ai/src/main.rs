@@ -104,6 +104,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         supervisor
             .policy_engine_mut()
             .grant(caller.clone(), "proc.list");
+        supervisor
+            .policy_engine_mut()
+            .grant(caller.clone(), "fs.file.read");
     }
 
     println!("Starting worker process and establishing private IPC channel...");
@@ -128,7 +131,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         match supervisor.execute_turn(&caller, &prompt) {
             Ok(complete_turn) => {
-                println!("Turn execution completed with status: {:?}", complete_turn.status);
+                println!(
+                    "Turn execution completed with status: {:?}",
+                    complete_turn.status
+                );
                 println!("Response:\n{}", complete_turn.response_text);
             }
             Err(e) => {

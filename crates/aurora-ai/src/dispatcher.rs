@@ -12,8 +12,9 @@ use std::sync::Arc;
 use crate::identity::CallerIdentity;
 use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::provider::{
-    CpuProvider, LinuxProcFsProcessProvider, LinuxProcMeminfoMemoryProvider,
-    LinuxProcStatCpuProvider, MemoryProvider, ProcessProvider,
+    CapabilityExecutionError, CpuProvider, FileProvider, LinuxProcFsProcessProvider,
+    LinuxProcMeminfoMemoryProvider, LinuxProcStatCpuProvider, MemoryProvider, MockFileProvider,
+    ProcessProvider, SandboxedLocalFileProvider,
 };
 use aurora_protocol::{
     CapabilityError, CapabilityOutcome, CapabilityResult, CURRENT_PROTOCOL_VERSION,
@@ -26,16 +27,28 @@ pub struct CapabilityDispatcher {
     cpu_provider: Arc<dyn CpuProvider>,
     memory_provider: Arc<dyn MemoryProvider>,
     process_provider: Arc<dyn ProcessProvider>,
+    file_provider: Arc<dyn FileProvider>,
 }
 
 impl CapabilityDispatcher {
     /// Creates a new dispatcher with the provided policy engine and CPU provider.
     pub fn new(policy_engine: PolicyEngine, cpu_provider: Arc<dyn CpuProvider>) -> Self {
+        let sandbox_root = policy_engine.registry().sandbox_root().to_path_buf();
+        let file_provider: Arc<dyn FileProvider> =
+            match SandboxedLocalFileProvider::new(&sandbox_root) {
+                Ok(p) => Arc::new(p),
+                Err(_) => Arc::new(MockFileProvider::with_error(CapabilityExecutionError::new(
+                    "IO_ERROR",
+                    "Failed to open sandbox root",
+                ))),
+            };
+
         Self {
             policy_engine,
             cpu_provider,
             memory_provider: Arc::new(LinuxProcMeminfoMemoryProvider::new()),
             process_provider: Arc::new(LinuxProcFsProcessProvider::new()),
+            file_provider,
         }
     }
 
@@ -51,42 +64,97 @@ impl CapabilityDispatcher {
         self
     }
 
+    /// Attaches a custom file provider (useful for testing with mock providers).
+    pub fn with_file_provider(mut self, file_provider: Arc<dyn FileProvider>) -> Self {
+        self.file_provider = file_provider;
+        self
+    }
+
     /// Creates a dispatcher with explicit policy engine, CPU provider, and memory provider.
     pub fn new_with_providers(
         policy_engine: PolicyEngine,
         cpu_provider: Arc<dyn CpuProvider>,
         memory_provider: Arc<dyn MemoryProvider>,
     ) -> Self {
+        let sandbox_root = policy_engine.registry().sandbox_root().to_path_buf();
+        let file_provider: Arc<dyn FileProvider> =
+            match SandboxedLocalFileProvider::new(&sandbox_root) {
+                Ok(p) => Arc::new(p),
+                Err(_) => Arc::new(MockFileProvider::with_error(CapabilityExecutionError::new(
+                    "IO_ERROR",
+                    "Failed to open sandbox root",
+                ))),
+            };
+
         Self {
             policy_engine,
             cpu_provider,
             memory_provider,
             process_provider: Arc::new(LinuxProcFsProcessProvider::new()),
+            file_provider,
         }
     }
 
-    /// Creates a dispatcher with explicit policy engine and all capability providers.
+    /// Creates a dispatcher with explicit policy engine, CPU provider, memory provider, and process provider.
     pub fn new_with_all_providers(
         policy_engine: PolicyEngine,
         cpu_provider: Arc<dyn CpuProvider>,
         memory_provider: Arc<dyn MemoryProvider>,
         process_provider: Arc<dyn ProcessProvider>,
     ) -> Self {
+        let sandbox_root = policy_engine.registry().sandbox_root().to_path_buf();
+        let file_provider: Arc<dyn FileProvider> =
+            match SandboxedLocalFileProvider::new(&sandbox_root) {
+                Ok(p) => Arc::new(p),
+                Err(_) => Arc::new(MockFileProvider::with_error(CapabilityExecutionError::new(
+                    "IO_ERROR",
+                    "Failed to open sandbox root",
+                ))),
+            };
+
         Self {
             policy_engine,
             cpu_provider,
             memory_provider,
             process_provider,
+            file_provider,
+        }
+    }
+
+    /// Creates a dispatcher with explicit policy engine and all four capability providers.
+    pub fn new_with_all_capability_providers(
+        policy_engine: PolicyEngine,
+        cpu_provider: Arc<dyn CpuProvider>,
+        memory_provider: Arc<dyn MemoryProvider>,
+        process_provider: Arc<dyn ProcessProvider>,
+        file_provider: Arc<dyn FileProvider>,
+    ) -> Self {
+        Self {
+            policy_engine,
+            cpu_provider,
+            memory_provider,
+            process_provider,
+            file_provider,
         }
     }
 
     /// Creates a default dispatcher with MVP policy configuration and Linux telemetry providers.
     pub fn new_default(sandbox_root: PathBuf) -> Self {
-        Self::new_with_all_providers(
+        let file_provider: Arc<dyn FileProvider> =
+            match SandboxedLocalFileProvider::new(&sandbox_root) {
+                Ok(p) => Arc::new(p),
+                Err(_) => Arc::new(MockFileProvider::with_error(CapabilityExecutionError::new(
+                    "IO_ERROR",
+                    "Failed to open sandbox root",
+                ))),
+            };
+
+        Self::new_with_all_capability_providers(
             PolicyEngine::new_mvp(sandbox_root),
             Arc::new(LinuxProcStatCpuProvider::new()),
             Arc::new(LinuxProcMeminfoMemoryProvider::new()),
             Arc::new(LinuxProcFsProcessProvider::new()),
+            file_provider,
         )
     }
 
@@ -113,6 +181,11 @@ impl CapabilityDispatcher {
     /// Access the process provider.
     pub fn process_provider(&self) -> &Arc<dyn ProcessProvider> {
         &self.process_provider
+    }
+
+    /// Access the file provider.
+    pub fn file_provider(&self) -> &Arc<dyn FileProvider> {
+        &self.file_provider
     }
 
     /// Evaluates a proposal against policy without executing the capability.
@@ -273,6 +346,61 @@ impl CapabilityDispatcher {
                             },
                         }
                     },
+                    "fs.file.read" => {
+                        let path = match &proposal.parameters {
+                            serde_json::Value::Object(map) => match map.get("path") {
+                                Some(serde_json::Value::String(p)) => p.as_str(),
+                                _ => {
+                                    return CapabilityResult {
+                                        protocol_version: CURRENT_PROTOCOL_VERSION,
+                                        turn_id: proposal.turn_id.clone(),
+                                        call_id: proposal.call_id.clone(),
+                                        outcome: CapabilityOutcome::Failure {
+                                            error: CapabilityError {
+                                                code: "INVALID_ARGUMENT".to_string(),
+                                                message: "Expected 'path' string parameter"
+                                                    .to_string(),
+                                            },
+                                        },
+                                    };
+                                }
+                            },
+                            _ => {
+                                return CapabilityResult {
+                                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                                    turn_id: proposal.turn_id.clone(),
+                                    call_id: proposal.call_id.clone(),
+                                    outcome: CapabilityOutcome::Failure {
+                                        error: CapabilityError {
+                                            code: "INVALID_ARGUMENT".to_string(),
+                                            message: "Expected JSON object with 'path' parameter"
+                                                .to_string(),
+                                        },
+                                    },
+                                };
+                            }
+                        };
+
+                        match self.file_provider.read_file(path) {
+                            Ok(data) => CapabilityResult {
+                                protocol_version: CURRENT_PROTOCOL_VERSION,
+                                turn_id: proposal.turn_id.clone(),
+                                call_id: proposal.call_id.clone(),
+                                outcome: CapabilityOutcome::Success { data },
+                            },
+                            Err(err) => CapabilityResult {
+                                protocol_version: CURRENT_PROTOCOL_VERSION,
+                                turn_id: proposal.turn_id.clone(),
+                                call_id: proposal.call_id.clone(),
+                                outcome: CapabilityOutcome::Failure {
+                                    error: CapabilityError {
+                                        code: err.code,
+                                        message: err.message,
+                                    },
+                                },
+                            },
+                        }
+                    }
                     unimplemented => CapabilityResult {
                         protocol_version: CURRENT_PROTOCOL_VERSION,
                         turn_id: proposal.turn_id.clone(),

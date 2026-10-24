@@ -79,7 +79,8 @@ impl CapabilityRegistry {
         // 4. fs.file.read
         registry.register(CapabilityDefinition {
             id: "fs.file.read".to_string(),
-            description: "Reads file contents strictly within the demonstration sandbox".to_string(),
+            description: "Reads file contents strictly within the demonstration sandbox"
+                .to_string(),
             nature: CapabilityNature::Observational,
             requires_authorization: true,
         });
@@ -153,9 +154,17 @@ impl CapabilityRegistry {
                 }
             }
             "fs.file.read" => {
-                // Required parameter: "path" (string, must be component-contained in sandbox)
+                // Required parameter: "path" (strictly relative, clean subpath bounded to sandbox)
                 match params {
                     serde_json::Value::Object(map) => {
+                        for key in map.keys() {
+                            if key != "path" {
+                                return Err(format!(
+                                    "Unexpected parameter for fs.file.read: '{key}'"
+                                ));
+                            }
+                        }
+
                         let path_val = map
                             .get("path")
                             .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
@@ -164,14 +173,69 @@ impl CapabilityRegistry {
                             .as_str()
                             .ok_or_else(|| "Parameter 'path' must be a string".to_string())?;
 
+                        validate_fs_path(path_str)?;
                         is_component_contained(&self.sandbox_root, path_str)
                     }
-                    _ => Err("Expected JSON object with 'path' parameter for fs.file.read".to_string()),
+                    _ => Err(
+                        "Expected JSON object with 'path' parameter for fs.file.read".to_string(),
+                    ),
                 }
             }
-            _ => Err(format!("No parameter validation defined for unknown capability: '{capability_id}'")),
+            _ if self.capabilities.contains_key(capability_id) => Ok(()),
+            _ => Err(format!(
+                "No parameter validation defined for unknown capability: '{capability_id}'"
+            )),
         }
     }
+}
+
+/// Validates raw input path strings before any path parser or normalization runs.
+///
+/// Security & Contract Requirements:
+/// - Path must be relative to the sandbox root (cannot start with '/' or '~').
+/// - Length bounded to 1..=255 bytes.
+/// - Cannot be empty or whitespace-only.
+/// - Cannot contain null bytes ('\0') or ASCII control characters (< 32 or 127).
+/// - Raw segment inspection: explicitly rejects '.' (e.g. 'dir/./file.txt') and '..'.
+/// - Rejects empty segments (e.g. 'dir//file.txt' or trailing '/').
+pub fn validate_fs_path(path_str: &str) -> Result<(), String> {
+    if path_str.is_empty() || path_str.trim().is_empty() {
+        return Err("Path parameter cannot be empty or whitespace-only".to_string());
+    }
+
+    if path_str.len() > 255 {
+        return Err("Path parameter exceeds maximum permitted length of 255 bytes".to_string());
+    }
+
+    if path_str.contains('\0') {
+        return Err("Path contains illegal null byte".to_string());
+    }
+
+    if path_str.chars().any(|c| (c as u32) < 32 || c == '\x7f') {
+        return Err("Path contains illegal control characters".to_string());
+    }
+
+    // Relative-only path contract: must not start with '/' or '~'
+    if path_str.starts_with('/') || path_str.starts_with('~') {
+        return Err("Path must be relative to the sandbox root".to_string());
+    }
+
+    // Inspect raw path segments before any path parser or normalization runs
+    for segment in path_str.split('/') {
+        if segment == "." {
+            return Err("Explicit '.' path components are not permitted".to_string());
+        }
+        if segment == ".." {
+            return Err("Explicit '..' path components are not permitted".to_string());
+        }
+        if segment.is_empty() {
+            return Err(
+                "Empty path segments and consecutive slashes are not permitted".to_string(),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Normalizes a path by resolving '.' and '..' components without accessing the filesystem.
@@ -336,6 +400,112 @@ mod tests {
             .is_err());
         assert!(registry
             .validate_parameters("proc.list", &serde_json::json!([1, 2, 3]))
+            .is_err());
+    }
+
+    #[test]
+    fn test_fs_file_read_parameter_validation() {
+        let registry = CapabilityRegistry::new_mvp(PathBuf::from("/tmp/demo"));
+
+        // Valid relative paths
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "test.txt"}))
+            .is_ok());
+        assert!(registry
+            .validate_parameters(
+                "fs.file.read",
+                &serde_json::json!({"path": "subdir/notes.md"})
+            )
+            .is_ok());
+
+        // Rejection of explicit '.' components (raw segment inspection)
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "./test.txt"}))
+            .is_err());
+        assert!(registry
+            .validate_parameters(
+                "fs.file.read",
+                &serde_json::json!({"path": "dir/./file.txt"})
+            )
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "."}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "dir/."}))
+            .is_err());
+
+        // Rejection of '..' components
+        assert!(registry
+            .validate_parameters(
+                "fs.file.read",
+                &serde_json::json!({"path": "../secret.txt"})
+            )
+            .is_err());
+        assert!(registry
+            .validate_parameters(
+                "fs.file.read",
+                &serde_json::json!({"path": "dir/../file.txt"})
+            )
+            .is_err());
+
+        // Rejection of absolute paths
+        assert!(registry
+            .validate_parameters(
+                "fs.file.read",
+                &serde_json::json!({"path": "/tmp/demo/test.txt"})
+            )
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "/etc/passwd"}))
+            .is_err());
+
+        // Rejection of empty segments and consecutive slashes
+        assert!(registry
+            .validate_parameters(
+                "fs.file.read",
+                &serde_json::json!({"path": "dir//file.txt"})
+            )
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "dir/"}))
+            .is_err());
+
+        // Rejection of empty, whitespace, null, control chars, length > 255
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": ""}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "   "}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "foo\0bar"}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": "foo\nbar"}))
+            .is_err());
+        let long_path = "a".repeat(256);
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": long_path}))
+            .is_err());
+
+        // Rejection of unexpected extra fields
+        assert!(registry
+            .validate_parameters(
+                "fs.file.read",
+                &serde_json::json!({"path": "test.txt", "extra": 123})
+            )
+            .is_err());
+
+        // Rejection of non-object / non-string
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::json!({"path": 123}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("fs.file.read", &serde_json::Value::Null)
             .is_err());
     }
 }

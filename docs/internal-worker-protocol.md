@@ -176,4 +176,8 @@ Signals completion of turn synthesis.
 
 * **Language Agnosticism:** The protocol contract is conceptually independent of programming languages and wire encodings.
 * **Provisional Serialization:** For **Milestones 1 and 2**, message structures are validated using newline-delimited JSON (NDJSON) encoding over private stream channels. This allows rapid verification across Rust and Python without third-party binary serialization dependencies.
+* **Framing Limits and Transport Constraints:**
+  * **Maximum IPC Frame Size:** Exactly **512 KiB (524,288 bytes)**, measured in raw wire bytes including the terminating newline (`\n`).
+  * **Per-Frame Buffering Limit:** The 512 KiB limit serves as a deterministic per-frame buffering constraint designed to prevent stream desynchronization and unbounded buffer growth during worst-case JSON serialization (such as 64 KiB observation payloads expanding under `\u00XX` control character escaping). This transport limit does not alone guarantee immunity from all system-wide out-of-memory conditions.
+  * **Framing Invariants:** Each frame must terminate with a newline (`\n`). Any frame that exceeds 524,288 bytes, or reaches EOF without a terminating newline, is treated as a fatal framing violation. Both peers must immediately close the connection upon encountering a framing violation to ensure leftover or corrupt fragments are never misparsed as subsequent messages.
 * **Worker Replaceability:** Pursuant to ADR-001 Section 3.4, the Python worker process can be replaced in future releases by a native Rust or C++ inference engine (e.g., ONNX, Candle, or llama.cpp) by adhering to this identical protocol contract. The daemon requires no architectural changes or client-facing alterations when the worker runtime changes.

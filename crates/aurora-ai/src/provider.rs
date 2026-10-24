@@ -7,9 +7,10 @@
 //! - The Linux `/proc/stat` implementation is a prototype implementation choice,
 //!   abstracted behind the `CpuProvider` trait so it can be replaced in future releases.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Errors occurring during capability execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -712,6 +713,236 @@ impl ProcessProvider for MockProcessProvider {
     }
 }
 
+/// Maximum file size permitted for reading in bytes (64 KiB).
+pub const MAX_FILE_SIZE_BYTES: u64 = 64 * 1024; // 65,536 bytes
+
+/// Abstract provider interface for sandboxed filesystem reading.
+pub trait FileProvider: Send + Sync {
+    /// Reads a file strictly within the permitted sandbox boundary.
+    fn read_file(&self, path: &str) -> Result<serde_json::Value, CapabilityExecutionError>;
+}
+
+/// Thread-safe mock implementation of `FileProvider` for testing capability mediation.
+pub struct MockFileProvider {
+    invocation_count: AtomicUsize,
+    last_path: Mutex<Option<String>>,
+    result: Mutex<Result<serde_json::Value, CapabilityExecutionError>>,
+}
+
+impl MockFileProvider {
+    pub fn with_success(data: serde_json::Value) -> Self {
+        Self {
+            invocation_count: AtomicUsize::new(0),
+            last_path: Mutex::new(None),
+            result: Mutex::new(Ok(data)),
+        }
+    }
+
+    pub fn with_error(error: CapabilityExecutionError) -> Self {
+        Self {
+            invocation_count: AtomicUsize::new(0),
+            last_path: Mutex::new(None),
+            result: Mutex::new(Err(error)),
+        }
+    }
+
+    pub fn invocation_count(&self) -> usize {
+        self.invocation_count.load(Ordering::SeqCst)
+    }
+
+    pub fn last_path(&self) -> Option<String> {
+        self.last_path.lock().unwrap().clone()
+    }
+}
+
+impl FileProvider for MockFileProvider {
+    fn read_file(&self, path: &str) -> Result<serde_json::Value, CapabilityExecutionError> {
+        self.invocation_count.fetch_add(1, Ordering::SeqCst);
+        let mut last = self.last_path.lock().unwrap();
+        *last = Some(path.to_string());
+        self.result.lock().unwrap().clone()
+    }
+}
+
+/// Linux kernel-enforced sandboxed file reader using `openat2`.
+///
+/// # Security & Containment Architecture
+/// - Anchors file access to an already-open file descriptor for the trusted sandbox root (`dirfd`).
+/// - Delegates path resolution strictly to the Linux kernel via `openat2`.
+/// - Enforces `ResolveFlags`:
+///   - `RESOLVE_BENEATH`: Prohibits directory traversal (`..` or escaping paths) from exiting `dirfd`.
+///   - `RESOLVE_NO_SYMLINKS`: Prohibits symbolic links across all path components (intermediate and leaf).
+///   - `RESOLVE_NO_MAGICLINKS`: Prohibits procfs-style magic links (`/proc/[pid]/fd/*`).
+///   - `RESOLVE_NO_XDEV`: Prohibits mount-point and bind-mount crossings.
+/// - Opens descriptors with `OFlags::NONBLOCK` and uses `fstat` to verify regular files (`S_ISREG`),
+///   preventing blocking or reading FIFOs, directories, character devices, or sockets.
+/// - Limits reads to 65,536 bytes (64 KiB) using `take(65_537)`. Oversized files fail closed with `FILE_TOO_LARGE`.
+/// - Strictly validates UTF-8. Non-UTF-8 bytes fail closed with `INVALID_ENCODING`. Never returns partial content.
+/// - Fails closed immediately on `EAGAIN` or `ENOSYS`. Never falls back to userspace canonicalization.
+pub struct SandboxedLocalFileProvider {
+    sandbox_root: PathBuf,
+    dirfd: Arc<rustix::fd::OwnedFd>,
+    simulated_error: Mutex<Option<rustix::io::Errno>>,
+}
+
+impl SandboxedLocalFileProvider {
+    /// Creates a provider pointing to `sandbox_root`, opening and retaining its directory descriptor.
+    pub fn new(sandbox_root: impl Into<PathBuf>) -> Result<Self, CapabilityExecutionError> {
+        let root = sandbox_root.into();
+        let dirfd = rustix::fs::open(
+            &root,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|e| {
+            CapabilityExecutionError::new(
+                "IO_ERROR",
+                format!(
+                    "Failed to open sandbox root directory '{}': {e}",
+                    root.display()
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            sandbox_root: root,
+            dirfd: Arc::new(dirfd),
+            simulated_error: Mutex::new(None),
+        })
+    }
+
+    /// Injects a simulated syscall error for testing (e.g. `Errno::AGAIN` or `Errno::NOSYS`).
+    pub fn with_simulated_error(self, errno: rustix::io::Errno) -> Self {
+        *self.simulated_error.lock().unwrap() = Some(errno);
+        self
+    }
+
+    pub fn sandbox_root(&self) -> &Path {
+        &self.sandbox_root
+    }
+
+    fn map_open_error(err: rustix::io::Errno) -> CapabilityExecutionError {
+        match err {
+            rustix::io::Errno::NOENT => {
+                CapabilityExecutionError::new("NOT_FOUND", "File not found")
+            }
+            rustix::io::Errno::XDEV => CapabilityExecutionError::new(
+                "PERMISSION_DENIED",
+                "Access outside permitted sandbox directory denied",
+            ),
+            rustix::io::Errno::LOOP => CapabilityExecutionError::new(
+                "SYMLINK_REJECTED",
+                "Symbolic links are not permitted",
+            ),
+            rustix::io::Errno::AGAIN => CapabilityExecutionError::new(
+                "TEMPORARILY_UNAVAILABLE",
+                "File resource temporarily unavailable",
+            ),
+            rustix::io::Errno::NOSYS => CapabilityExecutionError::new(
+                "UNSUPPORTED_PLATFORM",
+                "Kernel-enforced path containment is unavailable (openat2 syscall not supported or blocked by system security policy)",
+            ),
+            rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => CapabilityExecutionError::new(
+                "IO_ERROR",
+                "Access to the requested file was denied by system permissions",
+            ),
+            _ => CapabilityExecutionError::new(
+                "IO_ERROR",
+                "An I/O error occurred while opening the file",
+            ),
+        }
+    }
+}
+
+impl FileProvider for SandboxedLocalFileProvider {
+    fn read_file(
+        &self,
+        relative_path: &str,
+    ) -> Result<serde_json::Value, CapabilityExecutionError> {
+        // Check for simulated error injection (for negative testing)
+        if let Some(err) = *self.simulated_error.lock().unwrap() {
+            return Err(Self::map_open_error(err));
+        }
+
+        let oflags =
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK;
+
+        let resolve = rustix::fs::ResolveFlags::BENEATH
+            | rustix::fs::ResolveFlags::NO_SYMLINKS
+            | rustix::fs::ResolveFlags::NO_MAGICLINKS
+            | rustix::fs::ResolveFlags::NO_XDEV;
+
+        let file_fd = match rustix::fs::openat2(
+            &self.dirfd,
+            relative_path,
+            oflags,
+            rustix::fs::Mode::empty(),
+            resolve,
+        ) {
+            Ok(fd) => fd,
+            Err(err) => return Err(Self::map_open_error(err)),
+        };
+
+        // Regular file verification via fstat
+        let stat = rustix::fs::fstat(&file_fd).map_err(|_| {
+            CapabilityExecutionError::new("IO_ERROR", "Failed to inspect file metadata")
+        })?;
+
+        let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+        if file_type.is_dir() {
+            return Err(CapabilityExecutionError::new(
+                "IS_A_DIRECTORY",
+                "Target path is a directory",
+            ));
+        }
+        if !file_type.is_file() {
+            return Err(CapabilityExecutionError::new(
+                "NOT_REGULAR_FILE",
+                "Target path is not a regular file",
+            ));
+        }
+
+        // Check file size against 64 KiB limit
+        if stat.st_size > MAX_FILE_SIZE_BYTES as i64 {
+            return Err(CapabilityExecutionError::new(
+                "FILE_TOO_LARGE",
+                "File size exceeds maximum permitted limit (64 KiB)",
+            ));
+        }
+
+        // Bounded read using take(MAX_FILE_SIZE_BYTES + 1)
+        let std_file = std::fs::File::from(file_fd);
+        let mut reader = std::io::Read::take(std_file, MAX_FILE_SIZE_BYTES + 1);
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).map_err(|_| {
+            CapabilityExecutionError::new("IO_ERROR", "Failed to read file contents")
+        })?;
+
+        if buffer.len() > MAX_FILE_SIZE_BYTES as usize {
+            return Err(CapabilityExecutionError::new(
+                "FILE_TOO_LARGE",
+                "File size exceeds maximum permitted limit (64 KiB)",
+            ));
+        }
+
+        // Strict UTF-8 validation (never return partial or corrupt content)
+        let content_str = match std::str::from_utf8(&buffer) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                return Err(CapabilityExecutionError::new(
+                    "INVALID_ENCODING",
+                    "File contents are not valid UTF-8 text",
+                ));
+            }
+        };
+
+        Ok(serde_json::json!({
+            "content": content_str,
+            "size_bytes": buffer.len()
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,5 +1230,94 @@ mod tests {
         let err = res.unwrap_err();
         assert_eq!(err.code, "IO_ERROR");
         assert!(err.message.contains("Failed to read process directory"));
+    }
+
+    #[test]
+    fn test_sandboxed_file_provider_nominal_and_boundaries() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aurora_test_sandbox_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Nominal file read
+        let sample_file = temp_dir.join("sample.txt");
+        std::fs::write(&sample_file, "hello sandbox world").unwrap();
+
+        let provider = SandboxedLocalFileProvider::new(&temp_dir).unwrap();
+        let res = provider.read_file("sample.txt").unwrap();
+        assert_eq!(res["content"], "hello sandbox world");
+        assert_eq!(res["size_bytes"], 19);
+
+        // 2. Missing file
+        let err_missing = provider.read_file("non_existent.txt").unwrap_err();
+        assert_eq!(err_missing.code, "NOT_FOUND");
+
+        // 3. Directory targeted
+        let sub_dir = temp_dir.join("subdir");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let err_dir = provider.read_file("subdir").unwrap_err();
+        assert_eq!(err_dir.code, "IS_A_DIRECTORY");
+
+        // 4. Direct provider sibling directory escape via ..
+        let sibling_dir =
+            std::env::temp_dir().join(format!("aurora_test_sibling_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sibling_dir);
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        std::fs::write(sibling_dir.join("secret.txt"), "OUTSIDE_SECRET").unwrap();
+
+        let err_escape = provider
+            .read_file("../aurora_test_sibling_escaped/secret.txt")
+            .unwrap_err();
+        assert_eq!(err_escape.code, "PERMISSION_DENIED");
+
+        // 5. Leaf symlink pointing outside
+        let leaf_link = temp_dir.join("leak_link.txt");
+        let _ = std::os::unix::fs::symlink(sibling_dir.join("secret.txt"), &leaf_link);
+        let err_symlink = provider.read_file("leak_link.txt").unwrap_err();
+        assert_eq!(err_symlink.code, "SYMLINK_REJECTED");
+
+        // 6. Intermediate directory symlink pointing outside
+        let dir_link = temp_dir.join("dir_link");
+        let _ = std::os::unix::fs::symlink(&sibling_dir, &dir_link);
+        let err_dir_symlink = provider.read_file("dir_link/secret.txt").unwrap_err();
+        assert_eq!(err_dir_symlink.code, "SYMLINK_REJECTED");
+
+        // 7. File size exactly 65,536 bytes succeeds
+        let exact_file = temp_dir.join("exact_64k.txt");
+        let exact_data = vec![b'a'; 65536];
+        std::fs::write(&exact_file, &exact_data).unwrap();
+        let res_exact = provider.read_file("exact_64k.txt").unwrap();
+        assert_eq!(res_exact["size_bytes"], 65536);
+
+        // 8. File size 65,537 bytes fails with FILE_TOO_LARGE
+        let large_file = temp_dir.join("large_64k.txt");
+        let large_data = vec![b'a'; 65537];
+        std::fs::write(&large_file, &large_data).unwrap();
+        let err_large = provider.read_file("large_64k.txt").unwrap_err();
+        assert_eq!(err_large.code, "FILE_TOO_LARGE");
+
+        // 9. Non-UTF8 binary file fails with INVALID_ENCODING
+        let bin_file = temp_dir.join("binary.bin");
+        std::fs::write(&bin_file, [0xff, 0xfe, 0xfd, 0x00]).unwrap();
+        let err_bin = provider.read_file("binary.bin").unwrap_err();
+        assert_eq!(err_bin.code, "INVALID_ENCODING");
+
+        // 10. Simulated EAGAIN from openat2 returns TEMPORARILY_UNAVAILABLE without fallback
+        let provider_eagain = SandboxedLocalFileProvider::new(&temp_dir)
+            .unwrap()
+            .with_simulated_error(rustix::io::Errno::AGAIN);
+        let err_eagain = provider_eagain.read_file("sample.txt").unwrap_err();
+        assert_eq!(err_eagain.code, "TEMPORARILY_UNAVAILABLE");
+
+        // 11. Simulated ENOSYS returns UNSUPPORTED_PLATFORM
+        let provider_enosys = SandboxedLocalFileProvider::new(&temp_dir)
+            .unwrap()
+            .with_simulated_error(rustix::io::Errno::NOSYS);
+        let err_enosys = provider_enosys.read_file("sample.txt").unwrap_err();
+        assert_eq!(err_enosys.code, "UNSUPPORTED_PLATFORM");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&sibling_dir);
     }
 }

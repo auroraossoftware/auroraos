@@ -327,22 +327,29 @@ fn test_supervisor_enforces_authorization_before_execution() {
 #[test]
 fn test_unimplemented_capabilities_return_not_implemented() {
     let caller = CallerIdentity::principal("client-app");
-    let mut policy = PolicyEngine::new_mvp(PathBuf::from("/tmp/sandbox"));
-    // Even if granted in policy, fs.file.read is not implemented until M6c
-    policy.grant(caller.clone(), "fs.file.read");
+    let mut registry = aurora_ai::CapabilityRegistry::new_mvp(PathBuf::from("/tmp/sandbox"));
+    registry.register(aurora_ai::CapabilityDefinition {
+        id: "app.launch".to_string(),
+        description: "Launch an application".to_string(),
+        nature: aurora_ai::CapabilityNature::Mutating,
+        requires_authorization: true,
+    });
+    let mut policy = PolicyEngine::new(registry);
+    // Explicitly granted in policy, but has no provider implementation in dispatcher
+    policy.grant(caller.clone(), "app.launch");
 
     let mock_provider = Arc::new(MockCpuProvider::with_success(serde_json::json!({})));
     let dispatcher = CapabilityDispatcher::new(policy, mock_provider.clone());
 
-    let fs_proposal = ProposeCapability {
+    let app_proposal = ProposeCapability {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         turn_id: "turn-m4-003".to_string(),
-        call_id: "call-fs-001".to_string(),
-        capability_name: "fs.file.read".to_string(),
-        parameters: serde_json::json!({"path": "test.txt"}),
+        call_id: "call-app-001".to_string(),
+        capability_name: "app.launch".to_string(),
+        parameters: serde_json::json!({}),
     };
 
-    let result = dispatcher.execute_proposal(&caller, &fs_proposal);
+    let result = dispatcher.execute_proposal(&caller, &app_proposal);
 
     // CPU provider is NOT touched
     assert_eq!(mock_provider.invocation_count(), 0);
@@ -352,6 +359,6 @@ fn test_unimplemented_capabilities_return_not_implemented() {
             assert_eq!(error.code, "NOT_IMPLEMENTED");
             assert!(error.message.contains("not implemented"));
         }
-        CapabilityOutcome::Success { .. } => panic!("fs.file.read unexpectedly succeeded"),
+        CapabilityOutcome::Success { .. } => panic!("app.launch unexpectedly succeeded"),
     }
 }

@@ -606,6 +606,233 @@ class TestWorkerLifecycle(unittest.TestCase):
         daemon_thread.join()
         server.close()
 
+    def test_bounded_socket_file_framing_limits(self):
+        """Verifies Python BoundedSocketFile enforces 512 KiB byte limit and handles edge cases."""
+        from worker.main import BoundedSocketFile, IpcFramingError, MAX_IPC_FRAME_SIZE
+        import io
+
+        # 1. Exact boundary: 524,288 bytes ending with \n
+        payload = b"x" * (MAX_IPC_FRAME_SIZE - 1) + b"\n"
+        s1, s2 = socket.socketpair()
+        # Use underlying makefile directly or mock
+        bf = BoundedSocketFile(s1)
+        # Mock _r with BytesIO to avoid socket buffer deadlock
+        bf._r = io.BytesIO(payload)
+        line = bf.readline()
+        self.assertEqual(len(line.encode("utf-8")), MAX_IPC_FRAME_SIZE)
+        bf.close()
+        s2.close()
+
+        # 2. Oversized: 524,289 bytes
+        oversized = b"x" * MAX_IPC_FRAME_SIZE + b"\n"
+        s1, s2 = socket.socketpair()
+        bf = BoundedSocketFile(s1)
+        bf._r = io.BytesIO(oversized)
+        with self.assertRaises(IpcFramingError):
+            bf.readline()
+        bf.close()
+        s2.close()
+
+        # 3. Unterminated reaching EOF without \n
+        unterminated = b"unterminated frame without newline"
+        s1, s2 = socket.socketpair()
+        bf = BoundedSocketFile(s1)
+        bf._r = io.BytesIO(unterminated)
+        with self.assertRaises(IpcFramingError):
+            bf.readline()
+        bf.close()
+        s2.close()
+
+    def test_bounded_socket_file_measures_multibyte_utf8_in_bytes(self):
+        """Verifies that BoundedSocketFile enforces limits in bytes, not Unicode characters."""
+        from worker.main import BoundedSocketFile, IpcFramingError, MAX_IPC_FRAME_SIZE
+        import io
+
+        # '€' is 3 bytes in UTF-8. 200,000 characters is 600,000 bytes.
+        # Character count (200,000) < 524,288, but byte count (600,001 with \n) > 524,288.
+        euro_char = "€"
+        self.assertEqual(len(euro_char.encode("utf-8")), 3)
+
+        oversized_text = (euro_char * 200_000) + "\n"
+        oversized_bytes = oversized_text.encode("utf-8")
+        self.assertEqual(len(oversized_bytes), 600_001)
+
+        s1, s2 = socket.socketpair()
+        bf = BoundedSocketFile(s1)
+        bf._r = io.BytesIO(oversized_bytes)
+        with self.assertRaises(IpcFramingError):
+            bf.readline()
+        bf.close()
+        s2.close()
+
+        # Within limit: 100,000 euro characters = 300,000 bytes + 1 '\n' = 300,001 bytes <= 524,288
+        valid_text = (euro_char * 100_000) + "\n"
+        valid_bytes = valid_text.encode("utf-8")
+        s1, s2 = socket.socketpair()
+        bf = BoundedSocketFile(s1)
+        bf._r = io.BytesIO(valid_bytes)
+        line = bf.readline()
+        self.assertEqual(len(line.encode("utf-8")), 300_001)
+        bf.close()
+        s2.close()
+
+    def test_bounded_socket_file_worst_case_control_characters_roundtrip(self):
+        """Verifies that a 64 KiB file of control characters expanding to ~393 KiB in JSON fits in 512 KiB."""
+        from worker.main import BoundedSocketFile, MAX_IPC_FRAME_SIZE
+        import io
+
+        # 64 KiB of '\x01' expands to 65,536 * 6 = 393,216 bytes in JSON
+        raw_control = "\x01" * 65536
+        daemon_msg = {
+            "type": "capability_result",
+            "protocol_version": 1,
+            "turn_id": "turn-worst-case-test",
+            "call_id": "call-fs-01",
+            "status": "success",
+            "data": {
+                "content": raw_control,
+                "size_bytes": 65536,
+            },
+        }
+        serialized = (json.dumps(daemon_msg) + "\n").encode("utf-8")
+
+        # Confirm serialized JSON size is ~393 KiB and strictly within 512 KiB limit
+        self.assertGreater(len(serialized), 390_000)
+        self.assertLessEqual(len(serialized), MAX_IPC_FRAME_SIZE)
+
+        s1, s2 = socket.socketpair()
+        bf = BoundedSocketFile(s1)
+        bf._r = io.BytesIO(serialized)
+        line = bf.readline()
+        parsed = json.loads(line.strip())
+        self.assertEqual(parsed.get("type"), "capability_result")
+        self.assertEqual(len(parsed["data"]["content"]), 65536)
+        bf.close()
+        s2.close()
+
+    def test_worker_terminates_and_closes_socket_on_framing_error(self):
+        """Verifies that run_worker exits with code 1 and closes the socket when daemon sends oversized frame."""
+        from worker.main import run_worker, MAX_IPC_FRAME_SIZE
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.socket_path)
+        server.listen(1)
+
+    def test_worker_terminates_and_closes_socket_on_framing_error(self):
+        """Verifies that run_worker exits with code 1 and closes the socket on framing error."""
+        from worker.main import run_worker, CURRENT_PROTOCOL_VERSION
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.socket_path)
+        server.listen(1)
+
+        def mock_daemon():
+            conn, _ = server.accept()
+            conn_file = conn.makefile("rw", buffering=1, encoding="utf-8")
+
+            # 1. Send Handshake
+            conn_file.write(
+                json.dumps({
+                    "type": "handshake",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "supported_capabilities": [],
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            # 2. Read HandshakeResponse
+            line = conn_file.readline()
+            hs = json.loads(line.strip())
+            self.assertEqual(hs.get("type"), "handshake_response")
+
+            # 3. Send unterminated frame reaching EOF without newline
+            conn_file.write("unterminated_frame_at_eof")
+            conn_file.flush()
+            conn_file.close()
+            conn.close()
+
+        daemon_thread = threading.Thread(target=mock_daemon)
+        daemon_thread.start()
+
+        exit_code = run_worker(self.socket_path)
+        # Framing error must result in exit code 1
+        self.assertEqual(exit_code, 1)
+
+        daemon_thread.join()
+        server.close()
+
+    def test_worker_proposes_fs_file_read_and_synthesizes_content(self):
+        """Verifies worker proposes fs.file.read for file queries and formats output."""
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.socket_path)
+        server.listen(1)
+
+        def mock_daemon():
+            conn, _ = server.accept()
+            conn_file = conn.makefile("rwb", buffering=0)
+
+            # Handshake
+            conn_file.write(
+                json.dumps({
+                    "type": "handshake",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "daemon_version": "0.1.0",
+                }).encode("utf-8") + b"\n"
+            )
+
+            # Read HandshakeResponse
+            resp = json.loads(conn_file.readline().decode("utf-8").strip())
+            self.assertEqual(resp.get("type"), "handshake_response")
+
+            # Send RequestTurn: read notes.txt
+            conn_file.write(
+                json.dumps({
+                    "type": "request_turn",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "turn_id": "turn-fs-01",
+                    "prompt": "read notes.txt",
+                    "available_capabilities": [],
+                }).encode("utf-8") + b"\n"
+            )
+
+            # Read ProposeCapability
+            prop = json.loads(conn_file.readline().decode("utf-8").strip())
+            self.assertEqual(prop.get("type"), "propose_capability")
+            self.assertEqual(prop.get("capability_name"), "fs.file.read")
+            self.assertEqual(prop.get("parameters"), {"path": "notes.txt"})
+
+            # Send CapabilityResult
+            conn_file.write(
+                json.dumps({
+                    "type": "capability_result",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "turn_id": "turn-fs-01",
+                    "call_id": prop.get("call_id"),
+                    "outcome": {
+                        "status": "success",
+                        "data": {"content": "Hello Aurora OS sandboxed file", "size_bytes": 31},
+                    },
+                }).encode("utf-8") + b"\n"
+            )
+
+            # Read CompleteTurn
+            comp = json.loads(conn_file.readline().decode("utf-8").strip())
+            self.assertEqual(comp.get("type"), "complete_turn")
+            self.assertEqual(comp.get("status"), "success")
+            self.assertIn("File content (31 bytes): Hello Aurora OS", comp.get("response_text", ""))
+
+            conn_file.close()
+            conn.close()
+
+        daemon_thread = threading.Thread(target=mock_daemon)
+        daemon_thread.start()
+
+        exit_code = run_worker(self.socket_path)
+        self.assertEqual(exit_code, 0)
+        daemon_thread.join()
+        server.close()
+
 
 if __name__ == "__main__":
     unittest.main()

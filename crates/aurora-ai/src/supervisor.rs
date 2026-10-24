@@ -374,6 +374,20 @@ impl WorkerSupervisor {
                     }
                 }),
             },
+            aurora_protocol::CapabilitySchema {
+                name: "fs.file.read".to_string(),
+                description: "Reads file contents strictly within the demonstration sandbox"
+                    .to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
         ];
 
         let request = aurora_protocol::RequestTurn {

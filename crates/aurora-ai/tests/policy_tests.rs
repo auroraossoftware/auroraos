@@ -53,7 +53,11 @@ fn test_allow_known_caller_valid_demo_fs_file_read() {
     let (engine, caller) = create_test_engine();
 
     // Relative path inside sandbox
-    let d1 = engine.evaluate(&caller, "fs.file.read", &serde_json::json!({"path": "sample.txt"}));
+    let d1 = engine.evaluate(
+        &caller,
+        "fs.file.read",
+        &serde_json::json!({"path": "sample.txt"}),
+    );
     assert!(d1.is_allowed(), "Expected ALLOW for relative sample.txt");
 
     // Nested relative path
@@ -64,13 +68,13 @@ fn test_allow_known_caller_valid_demo_fs_file_read() {
     );
     assert!(d2.is_allowed(), "Expected ALLOW for nested subdir/notes.md");
 
-    // Absolute path within sandbox
+    // Another relative path
     let d3 = engine.evaluate(
         &caller,
         "fs.file.read",
-        &serde_json::json!({"path": "/demo/data.json"}),
+        &serde_json::json!({"path": "data.json"}),
     );
-    assert!(d3.is_allowed(), "Expected ALLOW for absolute /demo/data.json");
+    assert!(d3.is_allowed(), "Expected ALLOW for relative data.json");
 }
 
 // ==========================================
@@ -150,7 +154,10 @@ fn test_deny_invalid_fs_file_read_parameters() {
     // Missing 'path' parameter
     let d1 = engine.evaluate(&caller, "fs.file.read", &serde_json::json!({}));
     assert!(d1.is_denied());
-    assert!(d1.reason().unwrap().contains("Missing required parameter 'path'"));
+    assert!(d1
+        .reason()
+        .unwrap()
+        .contains("Missing required parameter 'path'"));
 
     // Empty 'path' parameter
     let d2 = engine.evaluate(&caller, "fs.file.read", &serde_json::json!({"path": ""}));
@@ -167,14 +174,17 @@ fn test_deny_invalid_fs_file_read_parameters() {
 fn test_deny_filesystem_path_outside_demo_directory() {
     let (engine, caller) = create_test_engine();
 
-    // Absolute system files
+    // Absolute system files must be denied per relative-only contract
     let d1 = engine.evaluate(
         &caller,
         "fs.file.read",
         &serde_json::json!({"path": "/etc/passwd"}),
     );
     assert!(d1.is_denied());
-    assert!(d1.reason().unwrap().contains("escapes demo sandbox"));
+    assert!(d1
+        .reason()
+        .unwrap()
+        .contains("relative to the sandbox root"));
 
     let d2 = engine.evaluate(
         &caller,
@@ -182,7 +192,22 @@ fn test_deny_filesystem_path_outside_demo_directory() {
         &serde_json::json!({"path": "/var/log/syslog"}),
     );
     assert!(d2.is_denied());
-    assert!(d2.reason().unwrap().contains("escapes demo sandbox"));
+    assert!(d2
+        .reason()
+        .unwrap()
+        .contains("relative to the sandbox root"));
+
+    // Even absolute path matching sandbox prefix is denied under relative-only contract
+    let d3 = engine.evaluate(
+        &caller,
+        "fs.file.read",
+        &serde_json::json!({"path": "/demo/data.json"}),
+    );
+    assert!(d3.is_denied());
+    assert!(d3
+        .reason()
+        .unwrap()
+        .contains("relative to the sandbox root"));
 }
 
 #[test]
@@ -197,7 +222,7 @@ fn test_deny_filesystem_path_attempting_traversal() {
     );
     assert!(d1.is_denied());
     assert!(
-        d1.reason().unwrap().contains("escape") || d1.reason().unwrap().contains("traversal"),
+        d1.reason().unwrap().contains("..") || d1.reason().unwrap().contains("traversal"),
         "Unexpected reason: {:?}",
         d1.reason()
     );
@@ -209,7 +234,7 @@ fn test_deny_filesystem_path_attempting_traversal() {
     );
     assert!(d2.is_denied());
     assert!(
-        d2.reason().unwrap().contains("escape") || d2.reason().unwrap().contains("traversal"),
+        d2.reason().unwrap().contains("..") || d2.reason().unwrap().contains("traversal"),
         "Unexpected reason: {:?}",
         d2.reason()
     );
@@ -227,8 +252,7 @@ fn test_deny_demo_secret_when_sandbox_is_demo() {
         "fs.file.read",
         &serde_json::json!({"path": "/demo-secret/secret.txt"}),
     );
-    assert!(d1.is_denied(), "CRITICAL: /demo-secret must be rejected when sandbox is /demo");
-    assert!(d1.reason().unwrap().contains("escapes demo sandbox"));
+    assert!(d1.is_denied(), "CRITICAL: /demo-secret must be rejected");
 
     let d2 = engine.evaluate(
         &caller,
@@ -236,7 +260,6 @@ fn test_deny_demo_secret_when_sandbox_is_demo() {
         &serde_json::json!({"path": "../demo-secret/secret.txt"}),
     );
     assert!(d2.is_denied(), "CRITICAL: ../demo-secret must be rejected");
-    assert!(d2.reason().unwrap().contains("escapes demo sandbox"));
 }
 
 #[test]
@@ -276,7 +299,10 @@ fn test_determinism_identical_inputs_yield_identical_decisions() {
     let denied_params = serde_json::json!({"path": "/etc/shadow"});
     let first_denied = engine.evaluate(&caller, "fs.file.read", &denied_params);
     for _ in 0..100 {
-        assert_eq!(engine.evaluate(&caller, "fs.file.read", &denied_params), first_denied);
+        assert_eq!(
+            engine.evaluate(&caller, "fs.file.read", &denied_params),
+            first_denied
+        );
     }
 }
 

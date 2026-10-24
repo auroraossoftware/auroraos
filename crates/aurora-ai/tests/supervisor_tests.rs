@@ -130,3 +130,59 @@ fn test_clean_shutdown_removes_socket_and_reaps_worker() {
     supervisor.shutdown();
     assert!(!socket_path.exists());
 }
+
+#[test]
+fn test_supervisor_drops_connection_on_framing_error_preventing_fragment_reuse() {
+    use aurora_ai::{CallerIdentity, CapabilityDispatcher, IpcError, MAX_IPC_FRAME_SIZE};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let (s1, mut s2) = UnixStream::pair().expect("Failed to create UnixStream pair");
+
+    let config = create_test_config("framing_drop");
+    let dispatcher = CapabilityDispatcher::new_default(std::env::temp_dir());
+
+    let mut supervisor = WorkerSupervisor::from_stream(config, dispatcher, s1)
+        .expect("Failed to create supervisor from stream");
+
+    let caller = CallerIdentity::principal("user");
+
+    // Spawn a worker thread simulating an untrusted worker that sends an oversized frame
+    // followed immediately by a valid turn completion fragment.
+    let worker_thread = std::thread::spawn(move || {
+        // 1. Read RequestTurn from supervisor
+        let mut req_buf = [0u8; 1024];
+        let n = s2.read(&mut req_buf).expect("Failed to read RequestTurn");
+        assert!(n > 0);
+
+        // 2. Write oversized frame (> 512 KiB)
+        let oversized = vec![b'x'; MAX_IPC_FRAME_SIZE + 1];
+        s2.write_all(&oversized)
+            .expect("Failed to write oversized payload");
+        s2.write_all(b"\n").expect("Failed to write newline");
+
+        // 3. Write a subsequent valid message that MUST NOT be parsed
+        let valid_msg = b"{\"type\":\"complete_turn\",\"protocol_version\":1,\"turn_id\":\"turn-1\",\"status\":\"success\",\"response_text\":\"evil\"}\n";
+        let _ = s2.write_all(valid_msg);
+    });
+
+    // Supervisor attempts to execute turn
+    let turn_result = supervisor.execute_turn(&caller, "test prompt");
+
+    // Must fail with FrameTooLarge
+    match turn_result {
+        Err(SupervisorError::Ipc(IpcError::FrameTooLarge)) => {}
+        other => panic!("Expected FrameTooLarge, got: {other:?}"),
+    }
+
+    // CRITICAL SECURITY INVARIANT:
+    // Connection must be closed. Subsequent execution must fail with ConnectionClosed,
+    // proving leftover bytes can NEVER be interpreted as a new message.
+    let subsequent_result = supervisor.execute_turn(&caller, "second prompt");
+    match subsequent_result {
+        Err(SupervisorError::Ipc(IpcError::ConnectionClosed)) => {}
+        other => panic!("Expected ConnectionClosed on subsequent call, got: {other:?}"),
+    }
+
+    worker_thread.join().expect("Worker thread panicked");
+}

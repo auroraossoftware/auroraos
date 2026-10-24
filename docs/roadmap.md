@@ -2,7 +2,7 @@
 
 * **Status:** Living Document
 * **Authoritative Architecture Context:** [ADR-001](decisions/0001-core-daemon-and-worker-runtime-architecture.md), [ADR-002](decisions/0002-capability-and-permission-architecture.md), and [Vertical Slice Prototype Design](vertical-slice-prototype-design.md)
-* **Current Progress:** Milestones 1–5 Complete; Milestone 6 In Progress (M6a & M6b complete; M6c next)
+* **Current Progress:** Milestones 1–6 Complete (M6a, M6b, and M6c complete; Milestone 7 next)
 
 ---
 
@@ -26,7 +26,7 @@ The milestones documented below track prototype implementation progress against 
 | **M3** | Minimal Policy Engine & Capability Registry | **Complete** | Deterministic in-memory policy engine, default-deny evaluator, component-aware path checks. |
 | **M4** | First Capability (`sys.cpu.read`) Integrated | **Complete** | Provider abstraction, CapabilityDispatcher mediation, policy pre-authorization enforcement. |
 | **M5** | Complete End-to-End Request Flow | **Complete** | Full vertical slice: caller -> daemon -> worker -> proposal -> policy -> provider -> outcome -> worker synthesis -> caller response. |
-| **M6** | Remaining MVP Capabilities | **In Progress** (M6a & M6b complete; M6c next) | Implement `sys.memory.read` (M6a complete), `proc.list` (M6b complete), and component-contained `fs.file.read` (M6c next). |
+| **M6** | Remaining MVP Capabilities | **Complete** | Implemented `sys.memory.read` (M6a), `proc.list` (M6b), and kernel-contained `fs.file.read` (M6c). |
 | **M7** | Security, Rejection & Fault Containment Tests | Planned | Comprehensive adversarial test harness (traversal, prefix attacks, malformed frames). |
 | **M8** | Verification & Architecture Documentation Review | Planned | End-to-end audit, performance baselines, and architectural findings review. |
 
@@ -222,8 +222,80 @@ The milestones documented below track prototype implementation progress against 
 ---
 
 ### Sub-milestone M6c: Sandboxed File Reading (`fs.file.read`)
-* **Status:** Planned (Follows M6b)
-* **Scope:**
-  * Scoped read-only filesystem capability strictly confined within a demonstration sandbox directory hierarchy.
-  * Rigorous defense against `..` traversal, sibling-prefix confusion, symbolic links, and race conditions.
-  * Fail-closed rejection and bounded read limits.
+* **Status:** Complete
+* **Purpose:** Implement and integrate the fourth concrete capability provider (`fs.file.read`) with kernel-enforced path containment, strict pre-normalization path validation, bounded 64 KiB reads, and safe 512 KiB byte-bounded IPC framing across Rust and Python.
+* **Main Deliverables:**
+  * **Byte-Bounded 512 KiB IPC Framing:**
+    * Shared `MAX_IPC_FRAME_SIZE = 524_288` bytes (512 KiB inclusive of trailing `\n`) enforced in raw bytes across Rust (`read_bounded_line` in `crates/aurora-ai/src/ipc.rs`) and Python (`BoundedSocketFile` in `worker/main.py`).
+    * Worst-case control-character expansion analysis: 64 KiB of control characters expands to ~393 KiB in JSON string escaping, fitting safely within the 512 KiB per-frame buffering limit with ~128 KiB headroom.
+    * Immediate fail-closed socket closure on oversized frames or unterminated frames at EOF to prevent message desynchronization or fragment misparsing.
+    * Protocol specification updated in `docs/internal-worker-protocol.md` (Section 5.1).
+  * **Kernel-Enforced Path Containment (`openat2`):**
+    * `FileProvider` trait and `SandboxedLocalFileProvider` in `crates/aurora-ai/src/provider.rs` backed by `rustix::fs::openat2`.
+    * Retained trusted sandbox root directory descriptor (`dirfd`) opened with `O_PATH | O_DIRECTORY | O_CLOEXEC`.
+    * Enforces `ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV`.
+    * Rejects leaf and intermediate symlinks (`SYMLINK_REJECTED`), mount crossings, and directory escapes.
+    * Concurrently safe against TOCTOU path-replacement races (verified via parallel stress test).
+  * **Strict Pre-Normalization Syntactic Validation:**
+    * `validate_fs_path` in `crates/aurora-ai/src/capability.rs` inspects raw path segments before any path parser or normalization runs.
+    * Strictly rejects relative traversal (`..`), explicit dot components (`.`, e.g. `dir/./file.txt`), empty segments / consecutive slashes (`//`), absolute paths (`/`), tildes (`~`), null bytes (`\0`), control characters, and lengths exceeding 255 bytes.
+    * Any syntactic or policy denial guarantees provider invocation count remains exactly 0.
+  * **Bounded & Regular File Safety:**
+    * Bounded read via `take(MAX_FILE_SIZE_BYTES + 1)` (65,537 bytes) enforcing the 64 KiB (65,536 bytes) limit. Files exceeding this are rejected (`FILE_TOO_LARGE`).
+    * Metadata inspection via `rustix::fs::fstat` verifying regular file status; directories (`IS_A_DIRECTORY`) and FIFOs/devices/sockets (`NOT_REGULAR_FILE`) are rejected immediately without blocking.
+    * Strict UTF-8 verification; binary files fail cleanly (`INVALID_ENCODING`) without returning partial contents.
+    * Explicit syscall error mapping (`NOT_FOUND`, `TEMPORARILY_UNAVAILABLE` on `EAGAIN`, `UNSUPPORTED_PLATFORM` on `ENOSYS`). Never falls back to userspace canonicalize-then-open.
+  * **Honest Security Boundary & Documentation:**
+    * Explicit documentation of hard-link threats (hard links can point outside sandbox if created in advance by a writer) and same-UID access caveats.
+    * Architectural boundary qualification: Python worker is not yet OS-sandboxed (e.g. seccomp, Landlock); containment is enforced at the daemon's capability provider level.
+  * **Worker & Supervisor Integration:**
+    * Worker stub in `worker/main.py` parses file requests ("read <path>"), proposes `fs.file.read`, and formats responses (`File content (<size> bytes): <preview>`).
+    * `WorkerSupervisor` advertises `fs.file.read` in handshake schema; `CapabilityDispatcher` dispatches authorized requests to `FileProvider`.
+* **Verification Performed:**
+  * IPC Framing Unit Tests in `crates/aurora-ai/src/ipc.rs` (10 tests): clean EOF, valid frame, exact boundary (524,288 bytes), oversized frame (+1 byte), unterminated frame at EOF, worst-case control character payload (~393 KiB), byte vs character counting for multibyte UTF-8, and connection teardown on framing error.
+  * Python Framing & Worker Tests in `worker/test_worker.py` (8 framing/file tests, 21 total suite tests): `BoundedSocketFile` exact limit, oversized rejection, unterminated EOF rejection, multibyte UTF-8 byte counting, worst-case control-character expansion roundtrip, socket closure on framing error, file read proposal, and turn synthesis.
+  * Capability & Path Validation Tests in `crates/aurora-ai/src/capability.rs`: rejection of `.`, `..`, empty segments, absolute paths, null bytes, control characters, oversized paths, and unexpected parameter fields.
+  * Direct Provider Unit Tests in `crates/aurora-ai/src/provider.rs`: nominal file reads, subpaths, 64 KiB exact, 64 KiB + 1 byte rejection, non-UTF8 rejection, directory rejection, and simulated syscall errors.
+  * Integration Tests in `crates/aurora-ai/tests/m6c_file_capability_tests.rs` (29 tests):
+    1. Unauthorized caller denied with provider count 0.
+    2. Anonymous caller denied with provider count 0.
+    3. Missing path parameter denied with provider count 0.
+    4. Non-string path parameter denied with provider count 0.
+    5. Unexpected parameter fields denied with provider count 0.
+    6. Control characters denied with provider count 0.
+    7. Empty and whitespace path denied with provider count 0.
+    8. Null byte path denied with provider count 0.
+    9. Path length exceeded (>255) denied with provider count 0.
+    10. Explicit dot component (`dir/./file.txt`, `./file.txt`, `.`) denied with provider count 0.
+    11. Traversal dot-dot (`../secret.txt`, `sub/../../etc/passwd`) denied with provider count 0.
+    12. Absolute path (`/etc/passwd`, `/sandbox/file.txt`) denied with provider count 0.
+    13. Direct provider sibling directory containment rejection.
+    14. Authorized nominal file read.
+    15. Nested subpath file read.
+    16. Leaf symlink rejected without leaking outside content.
+    17. Intermediate directory symlink rejected without leaking outside content.
+    18. FIFO rejected without blocking indefinitely.
+    19. Directory path rejected (`IS_A_DIRECTORY`).
+    20. File size exactly 64 KiB succeeds.
+    21. File size 64 KiB + 1 byte rejected (`FILE_TOO_LARGE`).
+    22. Non-UTF8 binary rejected (`INVALID_ENCODING`) without partial content.
+    23. Missing file returns `NOT_FOUND`.
+    24. Simulated `EAGAIN` returns `TEMPORARILY_UNAVAILABLE` safely.
+    25. Unsupported `ENOSYS` fails closed (`UNSUPPORTED_PLATFORM`).
+    26. Concurrent path-replacement race stress test (verifying outside sentinel data never leaks under parallel swap/read contention).
+    27. Authorized end-to-end file read turn with live Python worker.
+    28. Unauthorized end-to-end file read turn denied with `PERMISSION_DENIED`.
+    29. Escape end-to-end turn denied with `PERMISSION_DENIED`.
+  * Verification Summary:
+    - Functional & Integration Tests: PASSED (153 Rust tests across 10 test suites + 21 Python worker tests, 100% pass rate).
+    - Linter / Clippy: PASSED (`cargo clippy --workspace --all-targets --all-features -- -D warnings` clean with 0 warnings, 0 errors).
+    - Whitespace & Diff Check: PASSED (`git diff --check` clean with 0 errors).
+    - Targeted M6c Code Formatting: PASSED (M6c newly added and modified code verified compliant with `rustfmt`).
+    - Workspace-Wide Formatting Check: FAILED (`cargo fmt --all -- --check` fails with exit code 1 due to pre-existing legacy formatting variances in files from Milestones 1–6b; repository-wide reformatting was deliberately not applied to prevent unrelated diff churn across prior milestones).
+* **Relevant Code:**
+  * IPC: `crates/aurora-ai/src/ipc.rs`, `worker/main.py`
+  * Provider: `crates/aurora-ai/src/provider.rs`
+  * Path Validation: `crates/aurora-ai/src/capability.rs`
+  * Dispatcher: `crates/aurora-ai/src/dispatcher.rs`
+  * Specification: `docs/internal-worker-protocol.md`
+  * Tests: `crates/aurora-ai/tests/m6c_file_capability_tests.rs`, `worker/test_worker.py`

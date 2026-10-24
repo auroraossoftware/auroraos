@@ -29,6 +29,64 @@ from worker.protocol import (
 )
 
 WORKER_VERSION = "0.1.0"
+MAX_IPC_FRAME_SIZE = 512 * 1024  # 524,288 bytes (including terminating newline)
+
+
+class IpcFramingError(Exception):
+    """Raised when an IPC frame exceeds the maximum allowed size or reaches EOF without a newline."""
+    pass
+
+
+class BoundedSocketFile:
+    """Encapsulates a socket stream with strict byte-bounded line framing.
+
+    Enforces the 512 KiB (524,288 bytes) per-frame buffering limit in raw wire bytes.
+    If an oversized frame or an unterminated frame reaching EOF is encountered,
+    it immediately closes the socket connection to prevent stream desynchronization.
+    """
+
+    def __init__(self, sock: socket.socket, max_frame_size: int = MAX_IPC_FRAME_SIZE):
+        self.sock = sock
+        self.max_frame_size = max_frame_size
+        self._r = sock.makefile("rb")
+        self._w = sock.makefile("wb")
+
+    def readline(self, size: int = -1) -> str:
+        limit = self.max_frame_size if (size is None or size < 0) else min(size, self.max_frame_size)
+        raw = self._r.readline(limit + 1)
+        if not raw:
+            return ""
+        if len(raw) > self.max_frame_size:
+            self.close()
+            raise IpcFramingError(f"IPC frame exceeded maximum size of {self.max_frame_size} bytes")
+        if not raw.endswith(b"\n"):
+            self.close()
+            raise IpcFramingError("IPC frame reached EOF without a terminating newline")
+        return raw.decode("utf-8")
+
+    def write(self, data: str | bytes) -> int:
+        if isinstance(data, str):
+            b = data.encode("utf-8")
+        else:
+            b = data
+        return self._w.write(b)
+
+    def flush(self) -> None:
+        self._w.flush()
+
+    def close(self) -> None:
+        try:
+            self._r.close()
+        except Exception:
+            pass
+        try:
+            self._w.close()
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 PROCESS_QUERY_PATTERNS = [
     re.compile(r"\b(?:list|show|get|display|inspect)\s+(?:running\s+)?processes\b", re.IGNORECASE),
@@ -132,6 +190,38 @@ def handle_request_turn(sock_file, req_data: dict) -> None:
         )
         sock_file.write(json.dumps(prop.to_dict()) + "\n")
         sock_file.flush()
+    elif prompt.startswith("read "):
+        # Deterministic M6c behavior: propose fs.file.read
+        target_path = prompt[5:].strip()
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-fs-01",
+            capability_name="fs.file.read",
+            parameters={"path": target_path},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
+    elif "escape" in prompt:
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-fs-02",
+            capability_name="fs.file.read",
+            parameters={"path": "/etc/passwd"},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
+    elif "prefix_mismatch" in prompt:
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-fs-03",
+            capability_name="fs.file.read",
+            parameters={"path": "../demo-secret/secret.txt"},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
     else:
         # Default behavior: propose sys.cpu.read
         prop = ProposeCapability(
@@ -183,6 +273,13 @@ def handle_request_turn(sock_file, req_data: dict) -> None:
                 response_text = f"Host memory metrics: total={total_mb}MB, used={used_mb}MB, free={free_mb}MB, available={available_mb}MB"
             elif user is not None and idle is not None:
                 response_text = f"Host CPU metrics: user={user}%, system={system}%, idle={idle}%"
+            elif "content" in data and "size_bytes" in data:
+                content = data.get("content", "")
+                size = data.get("size_bytes", 0)
+                preview = content[:50].replace("\n", " ")
+                if len(content) > 50:
+                    preview += "..."
+                response_text = f"File content ({size} bytes): {preview}"
             else:
                 response_text = f"Capability executed successfully: {json.dumps(data)}"
         else:
@@ -221,7 +318,7 @@ def run_worker(
         print(f"[worker] Failed to connect to socket {socket_path}: {e}", file=sys.stderr)
         return 1
 
-    sock_file = sock.makefile("rw", buffering=1, encoding="utf-8")
+    sock_file = BoundedSocketFile(sock)
 
     try:
         # Step 1: Await Handshake from daemon
@@ -291,13 +388,15 @@ def run_worker(
 
         return 0
 
+    except IpcFramingError as e:
+        print(f"[worker] Fatal IPC framing error: {e}", file=sys.stderr)
+        return 1
     except (BrokenPipeError, ConnectionResetError):
         # Daemon disconnected
         return 0
     finally:
         try:
             sock_file.close()
-            sock.close()
         except Exception:
             pass
 
