@@ -13,10 +13,11 @@ use crate::identity::CallerIdentity;
 use crate::ipc::{read_worker_message, send_daemon_message, IpcError};
 use crate::policy::{PolicyDecision, PolicyEngine};
 use aurora_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityResult, DaemonToWorkerMessage, Handshake,
-    HandshakeResponse, HandshakeStatus, ProposeCapability, WorkerToDaemonMessage,
+    CapabilityResult, DaemonToWorkerMessage, Handshake, HandshakeResponse, HandshakeStatus,
+    ProposeCapability, WorkerToDaemonMessage, CURRENT_PROTOCOL_VERSION,
 };
 use std::io::BufReader;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -65,7 +66,9 @@ impl std::fmt::Display for SupervisorError {
             }
             Self::HandshakeRejected(reason) => write!(f, "handshake rejected by worker: {reason}"),
             Self::UnexpectedMessage(msg) => write!(f, "unexpected message received: {msg}"),
-            Self::SocketAlreadyExists(p) => write!(f, "socket path already exists: {}", p.display()),
+            Self::SocketAlreadyExists(p) => {
+                write!(f, "socket path already exists: {}", p.display())
+            }
         }
     }
 }
@@ -94,6 +97,8 @@ pub struct WorkerSupervisor {
     worker_version: Option<String>,
     dispatcher: CapabilityDispatcher,
     turn_counter: u64,
+    owns_socket: bool,
+    bound_socket_dev_ino: Option<(u64, u64)>,
 }
 
 impl WorkerSupervisor {
@@ -110,6 +115,8 @@ impl WorkerSupervisor {
             worker_version: None,
             dispatcher,
             turn_counter: 0,
+            owns_socket: false,
+            bound_socket_dev_ino: None,
         }
     }
 
@@ -125,6 +132,8 @@ impl WorkerSupervisor {
             worker_version: None,
             dispatcher,
             turn_counter: 0,
+            owns_socket: false,
+            bound_socket_dev_ino: None,
         }
     }
 
@@ -145,6 +154,8 @@ impl WorkerSupervisor {
             worker_version: Some("0.1.0".to_string()),
             dispatcher,
             turn_counter: 0,
+            owns_socket: false,
+            bound_socket_dev_ino: None,
         })
     }
 
@@ -198,19 +209,45 @@ impl WorkerSupervisor {
         self.worker_version.as_deref()
     }
 
+    /// Returns whether this supervisor instance owns the socket at `socket_path`.
+    pub fn owns_socket(&self) -> bool {
+        self.owns_socket
+    }
+
     /// Starts the supervisor: binds listener, spawns worker child, and performs handshake.
     pub fn start(&mut self) -> Result<(), SupervisorError> {
-        // Step 1: Ensure socket file does not already exist
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
+        // Step 1: Ensure socket path does not already contain any filesystem entry.
+        // Pre-checks without following symlinks (detects dead sockets, active listeners, files, or dangling symlinks).
+        // Refuses startup if any entry exists, preserving the pre-existing entry untouched without deletion.
+        match std::fs::symlink_metadata(&self.socket_path) {
+            Ok(_) => {
+                return Err(SupervisorError::SocketAlreadyExists(
+                    self.socket_path.clone(),
+                ));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path is clear; proceed to bind
+            }
+            Err(e) => {
+                return Err(SupervisorError::Io(e));
+            }
         }
 
         // Step 2: Bind Unix listener on private socket path
         let listener = UnixListener::bind(&self.socket_path).map_err(SupervisorError::Io)?;
-        listener.set_nonblocking(true).map_err(SupervisorError::Io)?;
+        self.owns_socket = true;
+        self.bound_socket_dev_ino = std::fs::symlink_metadata(&self.socket_path)
+            .ok()
+            .map(|m| (m.dev(), m.ino()));
+
+        if let Err(e) = listener.set_nonblocking(true) {
+            self.shutdown();
+            return Err(SupervisorError::Io(e));
+        }
 
         // Step 3: Spawn the worker process as an isolated child process
         if self.config.worker_command.is_empty() {
+            self.shutdown();
             return Err(SupervisorError::WorkerSpawnFailed(
                 "worker_command is empty".to_string(),
             ));
@@ -231,25 +268,53 @@ impl WorkerSupervisor {
         // Avoid leaking stdout/stderr by redirecting to null or inheriting
         cmd.stdin(Stdio::null());
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| SupervisorError::WorkerSpawnFailed(e.to_string()))?;
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                self.shutdown();
+                return Err(SupervisorError::WorkerSpawnFailed(e.to_string()));
+            }
+        };
         self.child = Some(child);
 
         // Step 4: Accept worker connection with timeout and premature exit detection
-        let stream = self.accept_worker_connection(&listener)?;
-        stream.set_nonblocking(false).map_err(SupervisorError::Io)?;
-        stream
-            .set_read_timeout(Some(self.config.socket_timeout))
-            .map_err(SupervisorError::Io)?;
-        stream
-            .set_write_timeout(Some(self.config.socket_timeout))
-            .map_err(SupervisorError::Io)?;
+        let stream = match self.accept_worker_connection(&listener) {
+            Ok(s) => s,
+            Err(e) => {
+                self.shutdown();
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = stream.set_nonblocking(false) {
+            self.shutdown();
+            return Err(SupervisorError::Io(e));
+        }
+        if let Err(e) = stream.set_read_timeout(Some(self.config.socket_timeout)) {
+            self.shutdown();
+            return Err(SupervisorError::Io(e));
+        }
+        if let Err(e) = stream.set_write_timeout(Some(self.config.socket_timeout)) {
+            self.shutdown();
+            return Err(SupervisorError::Io(e));
+        }
 
         // Step 5: Execute protocol handshake
-        let mut writer = stream.try_clone().map_err(SupervisorError::Io)?;
+        let mut writer = match stream.try_clone() {
+            Ok(w) => w,
+            Err(e) => {
+                self.shutdown();
+                return Err(SupervisorError::Io(e));
+            }
+        };
         let mut reader = BufReader::new(stream);
-        let worker_version = Self::execute_handshake_on_channels(&mut writer, &mut reader)?;
+        let worker_version = match Self::execute_handshake_on_channels(&mut writer, &mut reader) {
+            Ok(v) => v,
+            Err(e) => {
+                self.shutdown();
+                return Err(e);
+            }
+        };
         self.worker_version = Some(worker_version);
         self.writer = Some(writer);
         self.reader = Some(reader);
@@ -258,7 +323,10 @@ impl WorkerSupervisor {
     }
 
     /// Accepts the connection from the spawned child process within configured timeout.
-    fn accept_worker_connection(&mut self, listener: &UnixListener) -> Result<UnixStream, SupervisorError> {
+    fn accept_worker_connection(
+        &mut self,
+        listener: &UnixListener,
+    ) -> Result<UnixStream, SupervisorError> {
         let start = Instant::now();
         let timeout = self.config.handshake_timeout;
 
@@ -293,8 +361,9 @@ impl WorkerSupervisor {
         send_daemon_message(writer, &handshake_msg)?;
 
         // Read HandshakeResponse
-        let response = read_worker_message(reader)?
-            .ok_or(SupervisorError::HandshakeRejected("EOF before handshake response".to_string()))?;
+        let response = read_worker_message(reader)?.ok_or(SupervisorError::HandshakeRejected(
+            "EOF before handshake response".to_string(),
+        ))?;
 
         match response {
             WorkerToDaemonMessage::HandshakeResponse(HandshakeResponse {
@@ -397,7 +466,11 @@ impl WorkerSupervisor {
             available_capabilities,
         };
 
-        send_daemon_message(writer, &DaemonToWorkerMessage::RequestTurn(request))?;
+        if let Err(e) = send_daemon_message(writer, &DaemonToWorkerMessage::RequestTurn(request)) {
+            self.reader = None;
+            self.writer = None;
+            return Err(SupervisorError::Ipc(e));
+        }
 
         loop {
             let res = {
@@ -425,35 +498,62 @@ impl WorkerSupervisor {
             match msg {
                 WorkerToDaemonMessage::ProposeCapability(proposal) => {
                     if proposal.turn_id != turn_id {
+                        self.reader = None;
+                        self.writer = None;
                         return Err(SupervisorError::UnexpectedMessage(format!(
                             "Turn ID mismatch in proposal: expected '{turn_id}', got '{}'",
                             proposal.turn_id
                         )));
                     }
 
+                    if proposal.protocol_version != CURRENT_PROTOCOL_VERSION {
+                        self.reader = None;
+                        self.writer = None;
+                        return Err(SupervisorError::IncompatibleProtocolVersion {
+                            expected: CURRENT_PROTOCOL_VERSION,
+                            received: proposal.protocol_version,
+                        });
+                    }
+
                     // Enforce deterministic policy and execute capability provider strictly if authorized
                     let outcome = self.dispatcher.execute_proposal(caller, &proposal);
 
                     // Deliver CapabilityResult back to worker
-                    let writer = self
-                        .writer
-                        .as_mut()
-                        .ok_or(SupervisorError::Ipc(IpcError::ConnectionClosed))?;
-                    send_daemon_message(writer, &DaemonToWorkerMessage::CapabilityResult(outcome))?;
+                    let writer = match self.writer.as_mut() {
+                        Some(w) => w,
+                        None => {
+                            self.reader = None;
+                            return Err(SupervisorError::Ipc(IpcError::ConnectionClosed));
+                        }
+                    };
+                    if let Err(e) = send_daemon_message(
+                        writer,
+                        &DaemonToWorkerMessage::CapabilityResult(outcome),
+                    ) {
+                        self.reader = None;
+                        self.writer = None;
+                        return Err(SupervisorError::Ipc(e));
+                    }
                 }
                 WorkerToDaemonMessage::CompleteTurn(complete_turn) => {
                     if complete_turn.turn_id != turn_id {
+                        self.reader = None;
+                        self.writer = None;
                         return Err(SupervisorError::UnexpectedMessage(format!(
                             "Turn ID mismatch in complete_turn: expected '{turn_id}', got '{}'",
                             complete_turn.turn_id
                         )));
                     }
-                    complete_turn
-                        .validate()
-                        .map_err(|e| SupervisorError::UnexpectedMessage(e.to_string()))?;
+                    if let Err(e) = complete_turn.validate() {
+                        self.reader = None;
+                        self.writer = None;
+                        return Err(SupervisorError::UnexpectedMessage(e.to_string()));
+                    }
                     return Ok(complete_turn);
                 }
                 WorkerToDaemonMessage::HandshakeResponse(_) => {
+                    self.reader = None;
+                    self.writer = None;
                     return Err(SupervisorError::UnexpectedMessage(
                         "Unexpected HandshakeResponse during active turn".to_string(),
                     ));
@@ -477,7 +577,7 @@ impl WorkerSupervisor {
         }
     }
 
-    /// Cleanly terminates the worker process and unlinks the Unix socket file.
+    /// Cleanly terminates the worker process and unlinks the Unix socket file if owned.
     pub fn shutdown(&mut self) {
         // Drop stream channels to signal EOF to child
         self.reader = None;
@@ -491,9 +591,27 @@ impl WorkerSupervisor {
             }
         }
 
-        // Clean up socket file from filesystem
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
+        // Clean up socket file from filesystem strictly if this supervisor created/owns it.
+        // Safeguards:
+        // 1. If start() was refused due to an existing entry (or from_stream was used),
+        //    owns_socket is false and the pre-existing entry is never unlinked.
+        // 2. Socket-path replacement: verifies the entry is still a socket matching the bound inode.
+        // Residual limitation: A check-then-unlink sequence retains a microscopic TOCTOU window
+        // if an attacker with write access to the directory swaps the entry between check and unlink.
+        if self.owns_socket {
+            self.owns_socket = false;
+            if let Ok(meta) = std::fs::symlink_metadata(&self.socket_path) {
+                let is_socket = meta.file_type().is_socket();
+                let matches_bound_inode = self
+                    .bound_socket_dev_ino
+                    .map(|(dev, ino)| meta.dev() == dev && meta.ino() == ino)
+                    .unwrap_or(true);
+
+                if is_socket && matches_bound_inode {
+                    let _ = std::fs::remove_file(&self.socket_path);
+                }
+            }
+            self.bound_socket_dev_ino = None;
         }
     }
 }

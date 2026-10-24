@@ -2,7 +2,7 @@
 
 * **Status:** Living Document
 * **Authoritative Architecture Context:** [ADR-001](decisions/0001-core-daemon-and-worker-runtime-architecture.md), [ADR-002](decisions/0002-capability-and-permission-architecture.md), and [Vertical Slice Prototype Design](vertical-slice-prototype-design.md)
-* **Current Progress:** Milestones 1–6 Complete (M6a, M6b, and M6c complete; Milestone 7 next)
+* **Current Progress:** Milestones 1–7 Complete (Milestone 8 next)
 
 ---
 
@@ -12,8 +12,14 @@ The milestones documented below track prototype implementation progress against 
 
 1. **Deterministic Worker Stub (No Neural Models):** The AI worker process is a deterministic Python stub simulating reasoning and intent formulation; no real LLM, model runtime (PyTorch/llama.cpp), embeddings, or inference engine has been introduced.
 2. **IPC & Caller Authentication:** Public D-Bus IPC, system bus interfaces, and production caller authentication (e.g., Polkit integration, bus credentials) are deliberately deferred. In M1–M5, callers are represented via internal principal abstractions and direct CLI flags.
-3. **Worker Sandboxing:** Production-grade sandboxing (e.g., custom seccomp-bpf filters, Landlock, cgroups, user namespaces) has not yet been established. The worker currently executes as a standard unprivileged child process communicating over a private Unix domain socket.
+3. **Worker Sandboxing & Ambient Authority:** Operating-system-level confinement (e.g., custom seccomp-bpf filters, Landlock, cgroups, user/mount namespaces) has not yet been established. The worker currently executes as a standard unprivileged child process sharing the daemon's UID. While capability permissions and policy gates are strictly enforced at the daemon's dispatcher boundary, the worker process retains the ambient OS authority of its executing UID (including direct filesystem access to world-readable files and shared same-UID directories). True zero-ambient-authority confinement requires dedicated OS sandboxing.
 4. **Test Reporting:** All reported passing tests are implementation-reported automated test suite results verifying internal structural contracts, fail-closed boundaries, and execution paths; they do not represent independent third-party security certification.
+5. **Filesystem Socket Lifecycle & Threat-Model Boundaries:** Path-based Unix domain socket IPC in shared filesystem directories has inherent Linux VFS boundaries:
+   * *Cross-UID Isolation vs. Same-UID Boundaries:* The current implementation defaults to `std::env::temp_dir()` (typically `/tmp`) and does not create or validate parent directory permissions. Deploying the socket in an external private directory with mode `0700` owned by the daemon user is an operational deployment recommendation that isolates the socket from other unprivileged UIDs, but it is not enforced by code and does **not** protect against a malicious or compromised process sharing the daemon's own UID.
+   * *Two Distinct Socket Lifecycle Races on Shared Paths:*
+     1. *Post-Bind Ownership-Capture Race:* Between `UnixListener::bind(&path)` returning and `symlink_metadata(&path)` reading the host inode, a concurrent same-UID process could unlink the socket and substitute another entry, causing the daemon to record the replacement's inode.
+     2. *Shutdown Check-Then-Unlink Race:* Between `symlink_metadata(&path)` checking the entry on shutdown and `std::fs::remove_file(&path)` executing `unlink()`, a concurrent same-UID process could swap the socket with another file, causing the daemon to unlink the replacement. Linux provides no atomic `unlink_if_matches` syscall, and `fstat` on a socket descriptor queries `sockfs` (which diverges from the host filesystem's inode), preventing descriptor-based path validation.
+   * *Socket-Pair IPC Scope:* Transitioning to anonymous `socketpair` IPC in a future ADR removes all filesystem-path races for that channel, but process-level isolation, memory safety, and file-descriptor inheritance remain separate security concerns.
 
 ---
 
@@ -27,7 +33,7 @@ The milestones documented below track prototype implementation progress against 
 | **M4** | First Capability (`sys.cpu.read`) Integrated | **Complete** | Provider abstraction, CapabilityDispatcher mediation, policy pre-authorization enforcement. |
 | **M5** | Complete End-to-End Request Flow | **Complete** | Full vertical slice: caller -> daemon -> worker -> proposal -> policy -> provider -> outcome -> worker synthesis -> caller response. |
 | **M6** | Remaining MVP Capabilities | **Complete** | Implemented `sys.memory.read` (M6a), `proc.list` (M6b), and kernel-contained `fs.file.read` (M6c). |
-| **M7** | Security, Rejection & Fault Containment Tests | Planned | Comprehensive adversarial test harness (traversal, prefix attacks, malformed frames). |
+| **M7** | Security, Rejection & Fault Containment Tests | **Complete** (Reconciled Prototype Scope) | Adversarial test harness, non-destructive socket pre-checking, fail-closed invalidation, and documented threat-model boundaries. |
 | **M8** | Verification & Architecture Documentation Review | Planned | End-to-end audit, performance baselines, and architectural findings review. |
 
 ---
@@ -140,9 +146,8 @@ The milestones documented below track prototype implementation progress against 
 
 ---
 
-## 4. Milestone 6: Remaining MVP Capabilities (In Progress)
-
-* **Status:** In Progress (Sub-milestone M6a complete and verified; M6b next)
+## 4. Milestone 6: Remaining MVP Capabilities
+* **Status:** Complete (Sub-milestones M6a, M6b, and M6c complete)
 * **Target:** Remaining MVP Capabilities (`sys.memory.read`, `proc.list`, `fs.file.read`)
 * **Execution Strategy:** Divided into three strictly isolated sequential sub-milestones (M6a, M6b, M6c).
 
@@ -299,3 +304,118 @@ The milestones documented below track prototype implementation progress against 
   * Dispatcher: `crates/aurora-ai/src/dispatcher.rs`
   * Specification: `docs/internal-worker-protocol.md`
   * Tests: `crates/aurora-ai/tests/m6c_file_capability_tests.rs`, `worker/test_worker.py`
+
+---
+
+## 5. Milestone 7: Security, Rejection & Fault Containment Tests
+
+* **Status:** Complete (Reconciled Prototype Scope)
+* **Purpose:** Construct a comprehensive adversarial test harness and harden core supervisor lifecycle and protocol handling against hostile worker inputs, connection state desynchronization, socket path collisions, malformed frames, and path boundary attacks.
+* **Acceptance Criteria Reconciliation & Scope Boundary:**
+  * **Criteria Genuinely Met:**
+    * Comprehensive adversarial test suite covering all planned categories (29 Rust tests + 2 Python tests, 100% pass rate).
+    * Non-destructive startup refusal: all pre-existing filesystem entries (active listeners, dead sockets, regular files, dangling symlinks) are detected and refused without modification or deletion.
+    * Drop safety: dropping a failed supervisor instance never deletes pre-existing entries (`owns_socket` initialized to `false`).
+    * Post-bind internal failure cleanup: freshly bound sockets are cleaned up on spawn or handshake failure.
+    * Passive path replacement detection on shutdown: replacement regular files, directories, symlinks, or non-matching sockets are preserved.
+    * Fail-closed protocol invalidation on both inbound violations and outbound write transmission failures.
+    * Policy-before-provider execution invariant enforced across all 4 capabilities with 0 provider invocations on denial.
+  * **Reconciled Threat-Model Boundary:**
+    * If the milestone requirement for socket ownership is interpreted as *guaranteeing immunity against a hostile, concurrent same-UID process racing filesystem path entries in a shared directory*, this requirement cannot be met by path-based IPC under Linux POSIX semantics (due to `sockfs` inode divergence and the lack of atomic `unlink_if_matches`).
+    * Under the approved prototype scope (protecting against stale entries, uncoordinated instances, accidental conflicts, worker crashes, and cross-UID boundaries), Milestone 7 meets all acceptance criteria. Protection against malicious same-UID path manipulation is formally deferred to the proposed Socket-Pair IPC architecture.
+* **Main Deliverables & Hardening:**
+  * **Strict Socket Ownership & Non-Destructive Lifecycle Cleanup:**
+    * Hardened `WorkerSupervisor` in `crates/aurora-ai/src/supervisor.rs` with explicit socket ownership tracking (`owns_socket: bool`) and bound inode recording (`bound_socket_dev_ino: Option<(u64, u64)>`).
+    * Startup Pre-Check: checks `symlink_metadata(&self.socket_path)` without following symlinks. Refuses startup (`SupervisorError::SocketAlreadyExists(path)`) if any entry exists (active listener, dead socket, regular file, or dangling symlink) without modifying or deleting it.
+    * Drop & Shutdown Safety: `shutdown()` and `Drop::drop()` only unlink the socket path if `self.owns_socket` is true. If `start()` was refused or failed before bind (or if created via `from_stream`), `owns_socket` remains false, guaranteeing pre-existing entries are never deleted on drop or shutdown.
+    * Socket-Path Replacement Safeguard: `shutdown()` verifies that the entry at `self.socket_path` is still a socket (`FileTypeExt::is_socket()`) and matches the originally bound `(dev, ino)` before unlinking. Replacement entries (regular files, symlinks, or foreign sockets) are preserved untouched.
+    * Post-Bind Failure Cleanup: failures occurring after successful bind (spawn failure, accept timeout, handshake failure) cleanly invoke `shutdown()`, removing the bound socket and preventing avoidable stale entries.
+    * Configurable socket timeout builder `SupervisorConfig::with_socket_timeout(timeout)` in `crates/aurora-ai/src/config.rs`.
+  * **Detailed Documentation of Socket Lifecycle Races & Linux Semantics:**
+    * *Linux Kernel Semantics (`sockfs` vs. Host VFS):* In Linux, `fstat()` on a `UnixListener` descriptor returns the inode inside the kernel's internal `sockfs` pseudo-filesystem (`st_dev` of `sockfs`), whereas `lstat()` on the filesystem pathname returns the inode allocated by the host filesystem (e.g., `ext4`, `tmpfs`). Because these identifiers reside in distinct filesystems and never match, descriptor metadata cannot establish ownership of the pathname's filesystem entry.
+    * *Post-Bind Ownership-Capture Race:* Between `UnixListener::bind(&path)` returning and `symlink_metadata(&path)` reading the host inode, a concurrent same-UID process with write access to the directory could unlink the socket and substitute another entry. The subsequent `symlink_metadata` call would read and record the replacement entry's `(dev, ino)`, causing the supervisor to adopt ownership of an entry it did not create.
+    * *Shutdown Check-Then-Unlink Race:* Between `symlink_metadata(&path)` checking the entry on shutdown and `std::fs::remove_file(&path)` executing `unlink()`, a concurrent same-UID process could swap the socket with another file. Because Linux provides no atomic `unlink_if_matches` syscall, the daemon would unlink the replacement entry.
+    * *Guarantees Provided by Current Implementation:*
+      * Guaranteed protection against accidental startup collisions with dead/stale sockets, active listeners, and regular files.
+      * Guaranteed preservation of pre-existing entries when a failed supervisor instance is dropped.
+      * Guaranteed cleanup of freshly bound sockets if spawn or handshake fails internally.
+      * Guaranteed preservation of non-socket replacement files on shutdown.
+    * *Deployment Assumptions & Guarantees NOT Provided:*
+      * Aurora does **not** create or validate parent directory permissions or ownership; cross-UID protection is an environmental assumption requiring deployment in an externally managed `0700` directory.
+      * Even when deployed in an external `0700` directory, directory permissions do **not** isolate the daemon from a malicious or compromised process sharing the daemon's own UID.
+      * Path-based Unix sockets cannot provide atomic race immunity against concurrent same-UID filesystem manipulation in a shared directory.
+  * **Future Architecture Proposal: Socket-Pair IPC (Proposed ADR-0003):**
+    * *Proposal:* Transition the supervisor-worker IPC transport from a filesystem path rendezvous (`--socket-path`) to a connected anonymous Unix stream socket pair (`socketpair(AF_UNIX, SOCK_STREAM, 0)`) passed via file-descriptor inheritance.
+    * *Worker Startup:* Spawns the worker child with an inherited file descriptor (e.g. `--fd <N>` or inherited standard input), instantiated in Python via `socket.fromfd()`.
+    * *Descriptor Inheritance & Security:* Explicitly marks all other daemon descriptors `O_CLOEXEC` to prevent descriptor leakage to child processes.
+    * *Lifecycle Management:* Completely eliminates filesystem path creation, directory permissions, bind collisions, stale socket files, unlink races, and TOCTOU vulnerabilities; kernel automatically reaps descriptors and `sockfs` inodes upon process termination.
+    * *Protocol Compatibility:* 100% compliant with Internal Worker Protocol v1 (NDJSON framing up to 512 KiB and identical message schemas).
+    * *Testing:* Simplifies unit and integration testing by using `UnixStream::pair()` directly without temporary directory management.
+    * *Scope Clarification:* Socket-pair IPC removes filesystem-path races for that specific IPC channel, but process-level isolation, memory safety, and descriptor security remain separate concerns requiring dedicated OS sandboxing.
+  * **Fail-Closed Protocol Invalidation & Write-Failure Protection:**
+    * Cleanly distinguishes ordinary capability authorization denials (which return `CapabilityOutcome::Failure`, preserve the connection, and maintain provider invocation count == 0) from protocol-state violations.
+    * In `WorkerSupervisor::execute_turn_with_id()`: drops reader and writer channels (`self.reader = None; self.writer = None`) upon detecting:
+      * Inbound turn ID mismatches in `ProposeCapability` or `CompleteTurn`.
+      * Incompatible protocol versions (`IncompatibleProtocolVersion`).
+      * Protocol sequence violations (e.g., `HandshakeResponse` received during an active turn).
+      * `CompleteTurn` validation errors.
+      * Framing or deserialization errors.
+      * **Write-side transmission failures:** write failures during `RequestTurn` or `CapabilityResult` immediately invalidate channels before returning `SupervisorError::Ipc(e)`.
+    * Subsequent turns on a compromised, failed, or desynchronized connection fail closed immediately with `SupervisorError::ConnectionClosed`.
+  * **Adversarial Security Test Suite (`m7_adversarial_security_tests.rs`):**
+    * 29 comprehensive Rust integration tests across 7 distinct categories:
+      * **Authorization & Scoping (AUTH):**
+        * `AUTH-01`: Cross-caller context isolation in shared sessions (`test_cross_caller_turn_context_isolation`).
+        * `AUTH-02`: Parameter type confusion across all 4 MVP capabilities (`test_parameter_type_confusion_across_all_capabilities`).
+      * **Path & Filesystem Containment (PATH):**
+        * `PATH-01`: Exact 255-byte path boundary (`test_path_length_exact_255_byte_boundary`).
+        * `PATH-02`: Deeply nested directories (`test_deeply_nested_directory_containment`).
+        * `PATH-03`: Cyclic symlink loop containment (`test_cyclic_symlink_loop_safe_rejection`).
+        * `PATH-04`: Hard link outside sandbox known limitation assertion (`test_hard_link_known_limitation_demonstration`).
+        * `PATH-05`: Non-regular special files fail-closed (`test_special_non_regular_file_fail_closed_rejection`).
+      * **IPC Transport & Malformed Input (IPC):**
+        * `IPC-01`: Truncated frame mid-stream EOF (`test_truncated_frame_mid_stream_eof`).
+        * `IPC-02`: Fragment misparsing prevention after JSON syntax error (`test_fragment_misparsing_prevention_after_json_syntax_error`).
+        * `IPC-03`: Deeply nested JSON recursion bomb (`test_deeply_nested_json_recursion_bomb`).
+        * `IPC-04`: Whitespace and newline flooding (`test_whitespace_and_empty_newline_flooding`).
+        * `IPC-05`: Protocol version type invariance across message types (`test_numeric_protocol_version_invariance_across_messages`).
+      * **Message Integrity & Sequencing (MSG):**
+        * `MSG-01`: Turn ID mismatch in `ProposeCapability` invalidates connection (`test_turn_id_mismatch_in_proposal_terminates_connection`).
+        * `MSG-02`: Turn ID mismatch in `CompleteTurn` invalidates connection (`test_turn_id_mismatch_in_complete_turn_terminates_connection`).
+        * `MSG-03`: Unexpected `HandshakeResponse` during active turn terminates connection (`test_unexpected_handshake_response_during_turn_terminates_connection`).
+        * `MSG-04`: Unsolicited `ProposeCapability` before turn rejected (`test_unsolicited_capability_proposal_before_request_turn`).
+        * `MSG-05`: Empty and whitespace correlation IDs rejected (`test_empty_or_whitespace_correlation_ids_rejected`).
+      * **Worker Fault Containment (FLT):**
+        * `FLT-01`: Worker crash during result delivery handled safely and invalidates connection (`test_worker_crash_during_result_delivery_handled_safely`).
+        * `FLT-01b`: Worker disconnect during RequestTurn transmission invalidates connection (`test_write_failure_during_request_turn_invalidates_connection`).
+        * `FLT-02`: Turn socket read timeout handled safely (`test_turn_socket_read_timeout_and_cleanup`).
+        * `FLT-03`: Handshake connection timeout and child reap (`test_handshake_connection_timeout_and_child_reap`).
+        * `FLT-04a`: Stale dead socket collision refuses startup without deletion, verified post-drop (`test_stale_socket_entry_refuses_startup_without_deletion`).
+        * `FLT-04b`: Active listener socket collision refuses startup without deletion, verified post-drop and undisrupted (`test_active_listener_socket_refuses_startup_without_deletion`).
+        * `FLT-04c`: Conflicting regular file refuses startup without deletion, verified post-drop (`test_conflicting_regular_file_refuses_startup_without_deletion`).
+        * `FLT-04d`: Dangling symlink socket path refuses startup without deletion, verified post-drop (`test_dangling_symlink_refuses_startup_without_deletion`).
+        * `FLT-04e`: Socket path replacement safeguard preserves replacement file on shutdown (`test_socket_path_replacement_safeguard`).
+      * **Provider Failure Handling (PROV):**
+        * `PROV-01`: Corrupted telemetry fixtures parsed without panics (`test_corrupted_telemetry_source_handling_via_fixtures`).
+        * `PROV-02`: Unreadable file EACCES cleanly distinguished from policy denial (`test_unreadable_file_eacces_vs_policy_denial`).
+      * **Regression Protection (REG):**
+        * `REG-01`: Unified policy-before-provider execution matrix across all 4 MVP capabilities (`sys.cpu.read`, `sys.memory.read`, `proc.list`, `fs.file.read`) under anonymous, ungranted, invalid parameters, and unknown capabilities (`test_unified_policy_before_provider_matrix`).
+  * **Python Worker Adversarial Tests (`worker/test_adversarial.py`):**
+    * `PY-01`: Daemon framing error (> 512 KiB) causes worker to exit cleanly and close socket (`test_worker_terminates_and_closes_socket_on_daemon_framing_error`).
+    * `PY-02`: Malformed JSON from daemon rejected gracefully during turn handling (`test_worker_rejects_malformed_daemon_json_during_turn`).
+  * **Architectural Boundaries & Security Invariants Explicitly Maintained:**
+    * *No OS-Level Worker Sandboxing Yet:* Acknowledged that Python worker remains an unprivileged child process without seccomp or Landlock filters; capability containment is enforced at the daemon's dispatcher and provider boundaries. The worker retains ambient OS authority of its UID.
+    * *Hard-Link Invariant:* Re-verified that `openat2` prevents directory traversal but cannot prevent opening pre-existing hard links targeting external files; documented as an approved filesystem boundary constraint.
+    * *Socket Ownership Trade-Offs & TOCTOU:* Safe non-destructive refusal preserves external listeners and prevents drop-deletion; residual TOCTOU replacement window and post-bind capture race acknowledged.
+* **Verification Performed:**
+  * Rust Test Suite: 182 tests passing (48 unit tests, 9 M4, 12 M5, 10 M6a, 13 M6b, 29 M6c, 29 M7, 15 policy, 6 supervisor, 11 protocol).
+  * Python Test Suite: 23 tests passing (2 test_adversarial, 7 test_protocol, 14 test_worker).
+  * Total Automated Tests: 205 passed across the workspace (100% pass rate).
+  * Linter / Clippy: Clean run with `cargo clippy --workspace --all-targets --all-features -- -D warnings` (0 warnings, 0 errors).
+  * Formatting & Style: Clean run with `rustfmt --check crates/aurora-ai/tests/m7_adversarial_security_tests.rs crates/aurora-ai/src/config.rs crates/aurora-ai/src/supervisor.rs` and `git diff --check`.
+  * Workspace-Wide Formatting State: Fails on pre-existing legacy files from M1–M6b (`cargo fmt --all -- --check`), while all M7 files pass targeted checks.
+* **Relevant Code:**
+  * Supervisor: `crates/aurora-ai/src/supervisor.rs`
+  * Configuration: `crates/aurora-ai/src/config.rs`
+  * Rust Tests: `crates/aurora-ai/tests/m7_adversarial_security_tests.rs`
+  * Python Tests: `worker/test_adversarial.py`

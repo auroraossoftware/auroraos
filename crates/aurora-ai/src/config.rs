@@ -64,4 +64,10 @@ impl SupervisorConfig {
         self.handshake_timeout = timeout;
         self
     }
+
+    /// Sets read/write timeout on the established IPC socket (testability convenience).
+    pub fn with_socket_timeout(mut self, timeout: Duration) -> Self {
+        self.socket_timeout = timeout;
+        self
+    }
 }
