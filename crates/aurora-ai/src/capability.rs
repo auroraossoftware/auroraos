@@ -130,6 +130,13 @@ impl CapabilityRegistry {
                 match params {
                     serde_json::Value::Null => Ok(()),
                     serde_json::Value::Object(map) => {
+                        // Reject any unexpected fields
+                        for key in map.keys() {
+                            if key != "limit" {
+                                return Err(format!("Unexpected parameter for proc.list: '{key}'"));
+                            }
+                        }
+
                         if let Some(val) = map.get("limit") {
                             match val.as_i64() {
                                 Some(limit) if (1..=50).contains(&limit) => Ok(()),
@@ -142,7 +149,7 @@ impl CapabilityRegistry {
                             Ok(())
                         }
                     }
-                    _ => Err("Expected JSON object for proc.list parameters".to_string()),
+                    _ => Err("Expected JSON object or null for proc.list parameters".to_string()),
                 }
             }
             "fs.file.read" => {
@@ -293,6 +300,9 @@ mod tests {
 
         // Valid limits
         assert!(registry
+            .validate_parameters("proc.list", &serde_json::Value::Null)
+            .is_ok());
+        assert!(registry
             .validate_parameters("proc.list", &serde_json::json!({}))
             .is_ok());
         assert!(registry
@@ -302,7 +312,7 @@ mod tests {
             .validate_parameters("proc.list", &serde_json::json!({"limit": 50}))
             .is_ok());
 
-        // Invalid limits
+        // Invalid limits and unexpected parameters
         assert!(registry
             .validate_parameters("proc.list", &serde_json::json!({"limit": 0}))
             .is_err());
@@ -314,6 +324,18 @@ mod tests {
             .is_err());
         assert!(registry
             .validate_parameters("proc.list", &serde_json::json!({"limit": "ten"}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("proc.list", &serde_json::json!({"limit": 10.5}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("proc.list", &serde_json::json!({"limit": 10, "extra": "field"}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("proc.list", &serde_json::json!({"unexpected": 123}))
+            .is_err());
+        assert!(registry
+            .validate_parameters("proc.list", &serde_json::json!([1, 2, 3]))
             .is_err());
     }
 }

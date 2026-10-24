@@ -12,6 +12,7 @@ Milestone 2 establishes:
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -28,6 +29,26 @@ from worker.protocol import (
 )
 
 WORKER_VERSION = "0.1.0"
+
+PROCESS_QUERY_PATTERNS = [
+    re.compile(r"\b(?:list|show|get|display|inspect)\s+(?:running\s+)?processes\b", re.IGNORECASE),
+    re.compile(r"\b(?:list|show|get|display)\s+running\s+tasks\b", re.IGNORECASE),
+    re.compile(r"\brunning\s+processes\b", re.IGNORECASE),
+    re.compile(r"\brunning\s+tasks\b", re.IGNORECASE),
+    re.compile(r"\b(?:show\s+)?procs\b", re.IGNORECASE),
+    re.compile(r"\bps\b", re.IGNORECASE),
+    re.compile(r"\btop\s+processes\b", re.IGNORECASE),
+]
+
+
+def is_process_query(prompt: str) -> bool:
+    """Returns True only if prompt is an intended process listing request.
+
+    Uses strict regex word-boundary and phrase patterns to avoid false matches
+    on unrelated words containing 'ps' (e.g. 'steps', 'maps') or mentions of 'tasks'
+    in unrelated contexts (e.g. 'complete this task', 'task list for tomorrow').
+    """
+    return any(pat.search(prompt) for pat in PROCESS_QUERY_PATTERNS)
 
 
 def handle_request_turn(sock_file, req_data: dict) -> None:
@@ -96,6 +117,21 @@ def handle_request_turn(sock_file, req_data: dict) -> None:
         )
         sock_file.write(json.dumps(prop.to_dict()) + "\n")
         sock_file.flush()
+    elif is_process_query(prompt):
+        # Deterministic M6b behavior: propose proc.list
+        limit = 10
+        match = re.search(r"limit\s+(\d+)", prompt, re.IGNORECASE)
+        if match:
+            limit = int(match.group(1))
+        prop = ProposeCapability(
+            protocol_version=CURRENT_PROTOCOL_VERSION,
+            turn_id=turn_id,
+            call_id="call-proc-01",
+            capability_name="proc.list",
+            parameters={"limit": limit},
+        )
+        sock_file.write(json.dumps(prop.to_dict()) + "\n")
+        sock_file.flush()
     else:
         # Default behavior: propose sys.cpu.read
         prop = ProposeCapability(
@@ -126,20 +162,29 @@ def handle_request_turn(sock_file, req_data: dict) -> None:
 
     result = CapabilityResult.from_dict(res_data)
     if result.status == "success":
-        data = result.data or {}
-        total_mb = data.get("total_mb")
-        used_mb = data.get("used_mb")
-        free_mb = data.get("free_mb")
-        available_mb = data.get("available_mb")
+        data = result.data
+        if isinstance(data, list):
+            proc_summaries = [f"[{p.get('pid')}] {p.get('name')} ({p.get('memory_mb', 0)}MB)" for p in data]
+            summary_str = ", ".join(proc_summaries[:5])
+            if len(proc_summaries) > 5:
+                summary_str += f", ... (+{len(proc_summaries) - 5} more)"
+            response_text = f"Running processes ({len(data)} returned): {summary_str}"
+        elif isinstance(data, dict):
+            total_mb = data.get("total_mb")
+            used_mb = data.get("used_mb")
+            free_mb = data.get("free_mb")
+            available_mb = data.get("available_mb")
 
-        user = data.get("user_percent")
-        system = data.get("system_percent")
-        idle = data.get("idle_percent")
+            user = data.get("user_percent")
+            system = data.get("system_percent")
+            idle = data.get("idle_percent")
 
-        if total_mb is not None and available_mb is not None:
-            response_text = f"Host memory metrics: total={total_mb}MB, used={used_mb}MB, free={free_mb}MB, available={available_mb}MB"
-        elif user is not None and idle is not None:
-            response_text = f"Host CPU metrics: user={user}%, system={system}%, idle={idle}%"
+            if total_mb is not None and available_mb is not None:
+                response_text = f"Host memory metrics: total={total_mb}MB, used={used_mb}MB, free={free_mb}MB, available={available_mb}MB"
+            elif user is not None and idle is not None:
+                response_text = f"Host CPU metrics: user={user}%, system={system}%, idle={idle}%"
+            else:
+                response_text = f"Capability executed successfully: {json.dumps(data)}"
         else:
             response_text = f"Capability executed successfully: {json.dumps(data)}"
         turn_status = "success"

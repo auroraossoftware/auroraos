@@ -12,7 +12,8 @@ use std::sync::Arc;
 use crate::identity::CallerIdentity;
 use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::provider::{
-    CpuProvider, LinuxProcMeminfoMemoryProvider, LinuxProcStatCpuProvider, MemoryProvider,
+    CpuProvider, LinuxProcFsProcessProvider, LinuxProcMeminfoMemoryProvider,
+    LinuxProcStatCpuProvider, MemoryProvider, ProcessProvider,
 };
 use aurora_protocol::{
     CapabilityError, CapabilityOutcome, CapabilityResult, CURRENT_PROTOCOL_VERSION,
@@ -24,6 +25,7 @@ pub struct CapabilityDispatcher {
     policy_engine: PolicyEngine,
     cpu_provider: Arc<dyn CpuProvider>,
     memory_provider: Arc<dyn MemoryProvider>,
+    process_provider: Arc<dyn ProcessProvider>,
 }
 
 impl CapabilityDispatcher {
@@ -33,12 +35,19 @@ impl CapabilityDispatcher {
             policy_engine,
             cpu_provider,
             memory_provider: Arc::new(LinuxProcMeminfoMemoryProvider::new()),
+            process_provider: Arc::new(LinuxProcFsProcessProvider::new()),
         }
     }
 
     /// Attaches a custom memory provider (useful for testing with mock providers).
     pub fn with_memory_provider(mut self, memory_provider: Arc<dyn MemoryProvider>) -> Self {
         self.memory_provider = memory_provider;
+        self
+    }
+
+    /// Attaches a custom process provider (useful for testing with mock providers).
+    pub fn with_process_provider(mut self, process_provider: Arc<dyn ProcessProvider>) -> Self {
+        self.process_provider = process_provider;
         self
     }
 
@@ -52,15 +61,32 @@ impl CapabilityDispatcher {
             policy_engine,
             cpu_provider,
             memory_provider,
+            process_provider: Arc::new(LinuxProcFsProcessProvider::new()),
+        }
+    }
+
+    /// Creates a dispatcher with explicit policy engine and all capability providers.
+    pub fn new_with_all_providers(
+        policy_engine: PolicyEngine,
+        cpu_provider: Arc<dyn CpuProvider>,
+        memory_provider: Arc<dyn MemoryProvider>,
+        process_provider: Arc<dyn ProcessProvider>,
+    ) -> Self {
+        Self {
+            policy_engine,
+            cpu_provider,
+            memory_provider,
+            process_provider,
         }
     }
 
     /// Creates a default dispatcher with MVP policy configuration and Linux telemetry providers.
     pub fn new_default(sandbox_root: PathBuf) -> Self {
-        Self::new_with_providers(
+        Self::new_with_all_providers(
             PolicyEngine::new_mvp(sandbox_root),
             Arc::new(LinuxProcStatCpuProvider::new()),
             Arc::new(LinuxProcMeminfoMemoryProvider::new()),
+            Arc::new(LinuxProcFsProcessProvider::new()),
         )
     }
 
@@ -82,6 +108,11 @@ impl CapabilityDispatcher {
     /// Access the memory provider.
     pub fn memory_provider(&self) -> &Arc<dyn MemoryProvider> {
         &self.memory_provider
+    }
+
+    /// Access the process provider.
+    pub fn process_provider(&self) -> &Arc<dyn ProcessProvider> {
+        &self.process_provider
     }
 
     /// Evaluates a proposal against policy without executing the capability.
@@ -184,6 +215,63 @@ impl CapabilityDispatcher {
                                 },
                             },
                         },
+                    },
+                    "proc.list" => {
+                        let limit: usize = match &proposal.parameters {
+                            serde_json::Value::Object(map) => match map.get("limit") {
+                                Some(val) => match val.as_i64() {
+                                    Some(l) if (1..=50).contains(&l) => l as usize,
+                                    _ => {
+                                        return CapabilityResult {
+                                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                                            turn_id: proposal.turn_id.clone(),
+                                            call_id: proposal.call_id.clone(),
+                                            outcome: CapabilityOutcome::Failure {
+                                                error: CapabilityError {
+                                                    code: "INVALID_ARGUMENT".to_string(),
+                                                    message: "Invalid or malformed 'limit' parameter".to_string(),
+                                                },
+                                            },
+                                        };
+                                    }
+                                },
+                                None => 10,
+                            },
+                            serde_json::Value::Null => 10,
+                            _ => {
+                                return CapabilityResult {
+                                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                                    turn_id: proposal.turn_id.clone(),
+                                    call_id: proposal.call_id.clone(),
+                                    outcome: CapabilityOutcome::Failure {
+                                        error: CapabilityError {
+                                            code: "INVALID_ARGUMENT".to_string(),
+                                            message: "Expected JSON object or null for proc.list parameters".to_string(),
+                                        },
+                                    },
+                                };
+                            }
+                        };
+
+                        match self.process_provider.list_processes(limit) {
+                            Ok(data) => CapabilityResult {
+                                protocol_version: CURRENT_PROTOCOL_VERSION,
+                                turn_id: proposal.turn_id.clone(),
+                                call_id: proposal.call_id.clone(),
+                                outcome: CapabilityOutcome::Success { data },
+                            },
+                            Err(err) => CapabilityResult {
+                                protocol_version: CURRENT_PROTOCOL_VERSION,
+                                turn_id: proposal.turn_id.clone(),
+                                call_id: proposal.call_id.clone(),
+                                outcome: CapabilityOutcome::Failure {
+                                    error: CapabilityError {
+                                        code: err.code,
+                                        message: err.message,
+                                    },
+                                },
+                            },
+                        }
                     },
                     unimplemented => CapabilityResult {
                         protocol_version: CURRENT_PROTOCOL_VERSION,

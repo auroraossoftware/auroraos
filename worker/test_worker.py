@@ -418,6 +418,194 @@ class TestWorkerLifecycle(unittest.TestCase):
         daemon_thread.join()
         server.close()
 
+    def test_worker_handles_process_request_turn(self):
+        """Worker should propose proc.list when prompted for processes and format the result."""
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.socket_path)
+        server.listen(1)
+
+        def mock_daemon():
+            conn, _ = server.accept()
+            conn_file = conn.makefile("rw", buffering=1)
+
+            # 1. Handshake
+            conn_file.write(
+                json.dumps({
+                    "type": "handshake",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "daemon_version": "0.1.0",
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            # 2. Read HandshakeResponse
+            resp = json.loads(conn_file.readline().strip())
+            self.assertEqual(resp.get("type"), "handshake_response")
+
+            # 3. Send RequestTurn for processes
+            conn_file.write(
+                json.dumps({
+                    "type": "request_turn",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "turn_id": "turn-proc-01",
+                    "prompt": "list processes with limit 5",
+                    "available_capabilities": [],
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            # 4. Read ProposeCapability
+            prop = json.loads(conn_file.readline().strip())
+            self.assertEqual(prop.get("type"), "propose_capability")
+            self.assertEqual(prop.get("capability_name"), "proc.list")
+            self.assertEqual(prop.get("parameters", {}).get("limit"), 5)
+
+            # 5. Return CapabilityResult with process array
+            conn_file.write(
+                json.dumps({
+                    "type": "capability_result",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "turn_id": "turn-proc-01",
+                    "call_id": prop.get("call_id"),
+                    "outcome": {
+                        "status": "success",
+                        "data": [
+                            {"pid": 1, "name": "systemd", "memory_mb": 15},
+                            {"pid": 2, "name": "kthreadd", "memory_mb": 0},
+                        ],
+                    },
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            # 6. Read CompleteTurn
+            comp = json.loads(conn_file.readline().strip())
+            self.assertEqual(comp.get("type"), "complete_turn")
+            self.assertEqual(comp.get("status"), "success")
+            self.assertIn("systemd", comp.get("response_text", ""))
+            self.assertIn("Running processes", comp.get("response_text", ""))
+
+            conn_file.close()
+            conn.close()
+
+        daemon_thread = threading.Thread(target=mock_daemon)
+        daemon_thread.start()
+
+        exit_code = run_worker(self.socket_path)
+        self.assertEqual(exit_code, 0)
+        daemon_thread.join()
+        server.close()
+
+    def test_process_query_matching_intent_boundaries(self):
+        """Verifies process query matching distinguishes genuine queries from substrings/unrelated tasks."""
+        from worker.main import is_process_query
+
+        # 1. Genuine process-list queries
+        self.assertTrue(is_process_query("list processes"))
+        self.assertTrue(is_process_query("show processes"))
+        self.assertTrue(is_process_query("show running tasks"))
+        self.assertTrue(is_process_query("running processes"))
+        self.assertTrue(is_process_query("ps"))
+        self.assertTrue(is_process_query("top processes"))
+
+        # 2. Prompts containing 'ps' as part of an unrelated word (must NOT trigger proc.list)
+        self.assertFalse(is_process_query("what steps should we take?"))
+        self.assertFalse(is_process_query("check the maps"))
+        self.assertFalse(is_process_query("eclipse is running"))
+        self.assertFalse(is_process_query("https://example.com"))
+        self.assertFalse(is_process_query("oops something happened"))
+        self.assertFalse(is_process_query("stops here"))
+
+        # 3. Prompts mentioning 'tasks' in an unrelated context (must NOT trigger proc.list)
+        self.assertFalse(is_process_query("complete this task tomorrow"))
+        self.assertFalse(is_process_query("task list for sprint"))
+        self.assertFalse(is_process_query("what tasks are on my calendar?"))
+        self.assertFalse(is_process_query("multitasking is hard"))
+        self.assertFalse(is_process_query("schedule a daily task"))
+
+    def test_worker_does_not_propose_proc_list_for_unrelated_ps_or_task_words(self):
+        """Verifies worker does not propose proc.list when 'ps' or 'task' appears in unrelated context."""
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.socket_path)
+        server.listen(1)
+
+        def mock_daemon():
+            conn, _ = server.accept()
+            conn_file = conn.makefile("rw", buffering=1)
+
+            # 1. Handshake
+            conn_file.write(
+                json.dumps({
+                    "type": "handshake",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "daemon_version": "0.1.0",
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            # 2. Read HandshakeResponse
+            resp = json.loads(conn_file.readline().strip())
+            self.assertEqual(resp.get("type"), "handshake_response")
+
+            # 3. Send RequestTurn with 'steps' (contains 'ps') and 'task' in unrelated context
+            conn_file.write(
+                json.dumps({
+                    "type": "request_turn",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "turn_id": "turn-unrelated-01",
+                    "prompt": "what steps are required for this task?",
+                    "available_capabilities": [],
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            # 4. Read ProposeCapability: MUST NOT be proc.list (defaults to sys.cpu.read)
+            prop = json.loads(conn_file.readline().strip())
+            self.assertEqual(prop.get("type"), "propose_capability")
+            self.assertNotEqual(
+                prop.get("capability_name"),
+                "proc.list",
+                "Unrelated prompt containing 'steps' or 'task' incorrectly triggered proc.list!"
+            )
+            self.assertEqual(prop.get("capability_name"), "sys.cpu.read")
+
+            # 5. Return CapabilityResult
+            conn_file.write(
+                json.dumps({
+                    "type": "capability_result",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "turn_id": "turn-unrelated-01",
+                    "call_id": prop.get("call_id"),
+                    "outcome": {
+                        "status": "success",
+                        "data": {"user_percent": 10.0, "system_percent": 5.0, "idle_percent": 85.0},
+                    },
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            # 6. Read CompleteTurn
+            comp = json.loads(conn_file.readline().strip())
+            self.assertEqual(comp.get("type"), "complete_turn")
+            self.assertEqual(comp.get("status"), "success")
+
+            conn_file.close()
+            conn.close()
+
+        daemon_thread = threading.Thread(target=mock_daemon)
+        daemon_thread.start()
+
+        exit_code = run_worker(self.socket_path)
+        self.assertEqual(exit_code, 0)
+        daemon_thread.join()
+        server.close()
+
 
 if __name__ == "__main__":
     unittest.main()

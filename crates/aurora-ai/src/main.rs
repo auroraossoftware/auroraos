@@ -101,6 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         supervisor
             .policy_engine_mut()
             .grant(caller.clone(), "sys.memory.read");
+        supervisor
+            .policy_engine_mut()
+            .grant(caller.clone(), "proc.list");
     }
 
     println!("Starting worker process and establishing private IPC channel...");

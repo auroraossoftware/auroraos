@@ -360,6 +360,20 @@ impl WorkerSupervisor {
                 description: "Reads host memory telemetry metrics".to_string(),
                 parameters_schema: serde_json::json!({}),
             },
+            aurora_protocol::CapabilitySchema {
+                name: "proc.list".to_string(),
+                description: "Lists active processes with resource usage metrics".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50
+                        }
+                    }
+                }),
+            },
         ];
 
         let request = aurora_protocol::RequestTurn {

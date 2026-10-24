@@ -328,21 +328,21 @@ fn test_supervisor_enforces_authorization_before_execution() {
 fn test_unimplemented_capabilities_return_not_implemented() {
     let caller = CallerIdentity::principal("client-app");
     let mut policy = PolicyEngine::new_mvp(PathBuf::from("/tmp/sandbox"));
-    // Even if granted in policy, proc.list is not implemented until M6b
-    policy.grant(caller.clone(), "proc.list");
+    // Even if granted in policy, fs.file.read is not implemented until M6c
+    policy.grant(caller.clone(), "fs.file.read");
 
     let mock_provider = Arc::new(MockCpuProvider::with_success(serde_json::json!({})));
     let dispatcher = CapabilityDispatcher::new(policy, mock_provider.clone());
 
-    let proc_proposal = ProposeCapability {
+    let fs_proposal = ProposeCapability {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         turn_id: "turn-m4-003".to_string(),
-        call_id: "call-proc-001".to_string(),
-        capability_name: "proc.list".to_string(),
-        parameters: serde_json::json!({}),
+        call_id: "call-fs-001".to_string(),
+        capability_name: "fs.file.read".to_string(),
+        parameters: serde_json::json!({"path": "test.txt"}),
     };
 
-    let result = dispatcher.execute_proposal(&caller, &proc_proposal);
+    let result = dispatcher.execute_proposal(&caller, &fs_proposal);
 
     // CPU provider is NOT touched
     assert_eq!(mock_provider.invocation_count(), 0);
@@ -352,6 +352,6 @@ fn test_unimplemented_capabilities_return_not_implemented() {
             assert_eq!(error.code, "NOT_IMPLEMENTED");
             assert!(error.message.contains("not implemented"));
         }
-        CapabilityOutcome::Success { .. } => panic!("proc.list unexpectedly succeeded"),
+        CapabilityOutcome::Success { .. } => panic!("fs.file.read unexpectedly succeeded"),
     }
 }

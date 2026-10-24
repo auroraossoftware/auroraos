@@ -435,6 +435,283 @@ impl MemoryProvider for MockMemoryProvider {
     }
 }
 
+/// Abstract provider interface for retrieving active system processes.
+pub trait ProcessProvider: Send + Sync {
+    /// Lists active system processes bounded by the validated limit.
+    fn list_processes(&self, limit: usize) -> Result<serde_json::Value, CapabilityExecutionError>;
+}
+
+/// Linux prototype implementation of `ProcessProvider` reading `/proc` directly.
+///
+/// # Confinement and Minimal Information Exposure
+/// - Discovers numeric PID directories (`/proc/<pid>`).
+/// - Reads only minimal required process metadata:
+///   - Process name: read from `/proc/<pid>/comm` (clean executable basename, max 16 chars).
+///   - Resident memory: read from `/proc/<pid>/status` (`VmRSS:` line) in binary mebibytes (MiB).
+/// - Prohibited fields: Never reads `/proc/<pid>/cmdline` (arguments may contain secrets),
+///   `/proc/<pid>/environ` (environment variables), or file descriptors.
+/// - Zero shell execution: Inspects `/proc` strictly using Rust standard library filesystem APIs;
+///   no subshells, `ps`, `pgrep`, `top`, or subprocesses are ever invoked.
+///
+/// # Resiliency and Ephemeral Processes
+/// - Processes that exit or have permission restrictions during directory traversal are
+///   skipped gracefully without failing the entire capability.
+/// - Systemic failures (e.g. inability to read `/proc` directory) return an explicit `IO_ERROR`.
+///
+/// # Deterministic Ordering and Bounding
+/// - Results are sorted deterministically in ascending order by PID.
+/// - Results are truncated to return no more than the requested `limit`.
+pub struct LinuxProcFsProcessProvider {
+    proc_path: PathBuf,
+}
+
+impl LinuxProcFsProcessProvider {
+    /// Creates a provider pointing to the default `/proc` path.
+    pub fn new() -> Self {
+        Self {
+            proc_path: PathBuf::from("/proc"),
+        }
+    }
+
+    /// Creates a provider with a custom file path (useful for testing with synthetic directory trees).
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            proc_path: path.into(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.proc_path
+    }
+}
+
+impl Default for LinuxProcFsProcessProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessProvider for LinuxProcFsProcessProvider {
+    fn list_processes(&self, limit: usize) -> Result<serde_json::Value, CapabilityExecutionError> {
+        let entries = std::fs::read_dir(&self.proc_path).map_err(|e| {
+            CapabilityExecutionError::new(
+                "IO_ERROR",
+                format!("Failed to read process directory {}: {e}", self.proc_path.display()),
+            )
+        })?;
+
+        let mut processes = Vec::new();
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    // Systemic failure while iterating the directory stream must return an error,
+                    // not be silently ignored into a successful but incomplete process list.
+                    return Err(CapabilityExecutionError::new(
+                        "IO_ERROR",
+                        format!(
+                            "Error while enumerating directory entries in {}: {e}",
+                            self.proc_path.display()
+                        ),
+                    ));
+                }
+            };
+
+            let file_name = entry.file_name();
+            let name_str = match file_name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Filter for numeric PID directories
+            let pid: u32 = match name_str.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            let pid_dir = entry.path();
+            if !pid_dir.is_dir() {
+                continue;
+            }
+
+            // Read process name from /proc/<pid>/comm (executable basename)
+            let comm_path = pid_dir.join("comm");
+            let comm = match std::fs::read_to_string(&comm_path) {
+                Ok(c) => c.trim().to_string(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // Ephemeral process exited
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue, // Inaccessible/restricted process
+                Err(_) => continue, // Other per-process read error
+            };
+
+            if comm.is_empty() {
+                continue;
+            }
+
+            // Read memory from /proc/<pid>/status (VmRSS line in binary MiB)
+            let status_path = pid_dir.join("status");
+            let memory_mb = match std::fs::read_to_string(&status_path) {
+                Ok(status_content) => match parse_vmrss(&status_content) {
+                    VmRssStatus::Present(mib) => mib,
+                    VmRssStatus::Absent => {
+                        // Kernel threads and processes without user address space (no mm_struct)
+                        // legitimately have no VmRSS in /proc/<pid>/status; resident memory is 0.
+                        0
+                    }
+                    VmRssStatus::Malformed => {
+                        // VmRSS was present but corrupted/non-numeric.
+                        // Skip process rather than silently misrepresenting corrupt data as measured 0.
+                        continue;
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // Process exited
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue, // Inaccessible status
+                Err(_) => continue,
+            };
+
+            processes.push(ProcessEntry {
+                pid,
+                name: comm,
+                memory_mb,
+            });
+        }
+
+        // Sort deterministically in ascending order by PID
+        processes.sort_by_key(|p| p.pid);
+
+        // Truncate to limit
+        if processes.len() > limit {
+            processes.truncate(limit);
+        }
+
+        let json_entries: Vec<serde_json::Value> = processes
+            .into_iter()
+            .map(|p| {
+                serde_json::json!({
+                    "pid": p.pid,
+                    "name": p.name,
+                    "memory_mb": p.memory_mb,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::Value::Array(json_entries))
+    }
+}
+
+struct ProcessEntry {
+    pid: u32,
+    name: String,
+    memory_mb: u64,
+}
+
+/// Status of resident memory parsing from `/proc/<pid>/status`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VmRssStatus {
+    /// Measured resident memory in binary MiB.
+    Present(u64),
+    /// Kernel thread or process without userspace memory (no VmRSS line in status).
+    Absent,
+    /// VmRSS line was present but contained malformed/non-numeric data or unexpected units.
+    Malformed,
+}
+
+/// Parses resident set size (VmRSS) from `/proc/<pid>/status` content.
+pub fn parse_vmrss(status_content: &str) -> VmRssStatus {
+    for line in status_content.lines() {
+        if line.starts_with("VmRSS:") {
+            let mut parts = line.split_whitespace();
+            let _ = parts.next(); // "VmRSS:"
+            if let Some(val_str) = parts.next() {
+                if let Ok(kb) = val_str.parse::<u64>() {
+                    if let Some(unit) = parts.next() {
+                        if unit != "kB" {
+                            return VmRssStatus::Malformed;
+                        }
+                    }
+                    return VmRssStatus::Present(kb / 1024); // Binary MiB
+                }
+            }
+            return VmRssStatus::Malformed;
+        }
+    }
+    VmRssStatus::Absent
+}
+
+/// Parses the resident set size (VmRSS) from `/proc/<pid>/status` and converts from kB to binary MiB.
+pub fn parse_vmrss_mb(status_content: &str) -> u64 {
+    match parse_vmrss(status_content) {
+        VmRssStatus::Present(mib) => mib,
+        _ => 0,
+    }
+}
+
+/// Mock implementation of `ProcessProvider` for deterministic testing.
+///
+/// Tracks invocation counts and the exact limit parameter received.
+pub struct MockProcessProvider {
+    invocation_count: AtomicUsize,
+    last_limit: AtomicUsize,
+    simulated_result: Mutex<Result<serde_json::Value, CapabilityExecutionError>>,
+}
+
+impl MockProcessProvider {
+    /// Creates a mock provider returning a success payload.
+    pub fn with_success(data: serde_json::Value) -> Self {
+        Self {
+            invocation_count: AtomicUsize::new(0),
+            last_limit: AtomicUsize::new(0),
+            simulated_result: Mutex::new(Ok(data)),
+        }
+    }
+
+    /// Creates a mock provider returning a failure error.
+    pub fn with_failure(error: CapabilityExecutionError) -> Self {
+        Self {
+            invocation_count: AtomicUsize::new(0),
+            last_limit: AtomicUsize::new(0),
+            simulated_result: Mutex::new(Err(error)),
+        }
+    }
+
+    /// Returns the number of times `list_processes()` was invoked.
+    pub fn invocation_count(&self) -> usize {
+        self.invocation_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the last limit parameter passed to `list_processes()`.
+    pub fn last_limit(&self) -> usize {
+        self.last_limit.load(Ordering::SeqCst)
+    }
+
+    /// Configures the simulated outcome for future invocations.
+    pub fn set_result(&self, result: Result<serde_json::Value, CapabilityExecutionError>) {
+        *self.simulated_result.lock().unwrap() = result;
+    }
+}
+
+impl ProcessProvider for MockProcessProvider {
+    fn list_processes(&self, limit: usize) -> Result<serde_json::Value, CapabilityExecutionError> {
+        self.invocation_count.fetch_add(1, Ordering::SeqCst);
+        self.last_limit.store(limit, Ordering::SeqCst);
+        let guard = self.simulated_result.lock().unwrap();
+        match &*guard {
+            Ok(val) => {
+                if let serde_json::Value::Array(arr) = val {
+                    let mut truncated = arr.clone();
+                    if truncated.len() > limit {
+                        truncated.truncate(limit);
+                    }
+                    Ok(serde_json::Value::Array(truncated))
+                } else {
+                    Ok(val.clone())
+                }
+            }
+            Err(err) => Err(err.clone()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +885,119 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.code, "PARSE_ERROR");
         assert!(err.message.contains("Invalid numeric value"));
+    }
+
+    #[test]
+    fn test_mock_process_provider_counting_and_limit() {
+        let mock = MockProcessProvider::with_success(serde_json::json!([
+            {"pid": 1, "name": "systemd", "memory_mb": 12},
+            {"pid": 2, "name": "kthreadd", "memory_mb": 0},
+            {"pid": 100, "name": "bash", "memory_mb": 5},
+        ]));
+        assert_eq!(mock.invocation_count(), 0);
+
+        let res = mock.list_processes(2);
+        assert!(res.is_ok());
+        assert_eq!(mock.invocation_count(), 1);
+        assert_eq!(mock.last_limit(), 2);
+
+        let val = res.unwrap();
+        let arr = val.as_array().expect("Expected array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["pid"], 1);
+        assert_eq!(arr[1]["pid"], 2);
+    }
+
+    #[test]
+    fn test_parse_vmrss_mb() {
+        let sample = "Name:\tbash\nState:\tS (sleeping)\nVmRSS:\t   16384 kB\nThreads:\t1\n";
+        assert_eq!(parse_vmrss(sample), VmRssStatus::Present(16));
+        assert_eq!(parse_vmrss_mb(sample), 16);
+
+        let sample_zero = "Name:\tkthreadd\nState:\tS (sleeping)\n";
+        assert_eq!(parse_vmrss(sample_zero), VmRssStatus::Absent);
+        assert_eq!(parse_vmrss_mb(sample_zero), 0);
+
+        let sample_malformed_num = "Name:\tcorrupt\nVmRSS:\tnot_a_number kB\n";
+        assert_eq!(parse_vmrss(sample_malformed_num), VmRssStatus::Malformed);
+
+        let sample_unexpected_unit = "Name:\tcorrupt\nVmRSS:\t1024 MB\n";
+        assert_eq!(parse_vmrss(sample_unexpected_unit), VmRssStatus::Malformed);
+    }
+
+    #[test]
+    fn test_linux_procfs_process_provider_with_synthetic_dir() {
+        let temp_dir = std::env::temp_dir().join(format!("aurora_test_proc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Create numeric PID directories
+        let pid10 = temp_dir.join("10");
+        std::fs::create_dir_all(&pid10).unwrap();
+        std::fs::write(pid10.join("comm"), "init\n").unwrap();
+        std::fs::write(pid10.join("status"), "VmRSS: 2048 kB\n").unwrap();
+
+        let pid5 = temp_dir.join("5");
+        std::fs::create_dir_all(&pid5).unwrap();
+        std::fs::write(pid5.join("comm"), "kworker\n").unwrap();
+        // Kernel thread status without VmRSS line -> memory_mb is 0
+        std::fs::write(pid5.join("status"), "Name: kworker\nState: S\n").unwrap();
+
+        let pid20 = temp_dir.join("20");
+        std::fs::create_dir_all(&pid20).unwrap();
+        std::fs::write(pid20.join("comm"), "daemon\n").unwrap();
+        std::fs::write(pid20.join("status"), "VmRSS: 4096 kB\n").unwrap();
+
+        // 2. Create PID directory with malformed VmRSS (should be skipped, not falsely measured as 0)
+        let pid30 = temp_dir.join("30");
+        std::fs::create_dir_all(&pid30).unwrap();
+        std::fs::write(pid30.join("comm"), "corrupt_proc\n").unwrap();
+        std::fs::write(pid30.join("status"), "VmRSS: not_a_number kB\n").unwrap();
+
+        // 3. Create non-numeric directory (should be ignored)
+        let non_num = temp_dir.join("sys");
+        std::fs::create_dir_all(&non_num).unwrap();
+
+        // 4. Create vanishing process directory (status missing / process exited after comm, should be skipped)
+        let pid99 = temp_dir.join("99");
+        std::fs::create_dir_all(&pid99).unwrap();
+        std::fs::write(pid99.join("comm"), "vanishing\n").unwrap();
+        // status file intentionally omitted to simulate process exit between comm and status read
+
+        let provider = LinuxProcFsProcessProvider::with_path(&temp_dir);
+        let res = provider.list_processes(2).expect("Failed to list processes");
+        let arr = res.as_array().expect("Expected JSON array");
+
+        // Must be sorted by PID ascending (5, then 10) and truncated to limit (2)
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["pid"], 5);
+        assert_eq!(arr[0]["name"], "kworker");
+        assert_eq!(arr[0]["memory_mb"], 0);
+
+        assert_eq!(arr[1]["pid"], 10);
+        assert_eq!(arr[1]["name"], "init");
+        assert_eq!(arr[1]["memory_mb"], 2);
+
+        // When listing with a larger limit (10), corrupt_proc (pid 30) must be skipped
+        let res_all = provider.list_processes(10).expect("Failed to list processes");
+        let arr_all = res_all.as_array().expect("Expected JSON array");
+        assert_eq!(arr_all.len(), 3); // 5, 10, 20 (30 is skipped due to malformed VmRSS, 99 skipped due to missing comm)
+        assert_eq!(arr_all[0]["pid"], 5);
+        assert_eq!(arr_all[1]["pid"], 10);
+        assert_eq!(arr_all[2]["pid"], 20);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_linux_procfs_process_provider_inaccessible_dir_returns_io_error() {
+        let non_existent = PathBuf::from("/non_existent_proc_test_path_12345");
+        let provider = LinuxProcFsProcessProvider::with_path(non_existent);
+        let res = provider.list_processes(10);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.code, "IO_ERROR");
+        assert!(err.message.contains("Failed to read process directory"));
     }
 }

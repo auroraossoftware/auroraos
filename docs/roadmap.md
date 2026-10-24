@@ -2,7 +2,7 @@
 
 * **Status:** Living Document
 * **Authoritative Architecture Context:** [ADR-001](decisions/0001-core-daemon-and-worker-runtime-architecture.md), [ADR-002](decisions/0002-capability-and-permission-architecture.md), and [Vertical Slice Prototype Design](vertical-slice-prototype-design.md)
-* **Current Progress:** Milestones 1–5 Complete; Milestone 6 In Progress (M6a complete; M6b next)
+* **Current Progress:** Milestones 1–5 Complete; Milestone 6 In Progress (M6a & M6b complete; M6c next)
 
 ---
 
@@ -26,7 +26,7 @@ The milestones documented below track prototype implementation progress against 
 | **M3** | Minimal Policy Engine & Capability Registry | **Complete** | Deterministic in-memory policy engine, default-deny evaluator, component-aware path checks. |
 | **M4** | First Capability (`sys.cpu.read`) Integrated | **Complete** | Provider abstraction, CapabilityDispatcher mediation, policy pre-authorization enforcement. |
 | **M5** | Complete End-to-End Request Flow | **Complete** | Full vertical slice: caller -> daemon -> worker -> proposal -> policy -> provider -> outcome -> worker synthesis -> caller response. |
-| **M6** | Remaining MVP Capabilities | **In Progress** (M6a complete; M6b next) | Implement `sys.memory.read` (M6a complete), `proc.list` (M6b next), and component-contained `fs.file.read` (M6c). |
+| **M6** | Remaining MVP Capabilities | **In Progress** (M6a & M6b complete; M6c next) | Implement `sys.memory.read` (M6a complete), `proc.list` (M6b complete), and component-contained `fs.file.read` (M6c next). |
 | **M7** | Security, Rejection & Fault Containment Tests | Planned | Comprehensive adversarial test harness (traversal, prefix attacks, malformed frames). |
 | **M8** | Verification & Architecture Documentation Review | Planned | End-to-end audit, performance baselines, and architectural findings review. |
 
@@ -181,12 +181,43 @@ The milestones documented below track prototype implementation progress against 
 ---
 
 ### Sub-milestone M6b: Process Listing (`proc.list`)
-* **Status:** Next (Awaiting Review & Approval of M6a)
-* **Scope:**
-  * List active system processes with bounded resource usage metrics.
-  * Respect parameter contract: `1 <= limit <= 50`.
-  * Return structured process information without shell execution.
-  * Preserve authorization-before-execution and proof that denied requests never invoke the provider.
+* **Status:** Complete
+* **Purpose:** Implement and integrate the third concrete capability provider (`proc.list`) through the existing policy engine, capability dispatcher, and untrusted worker request flow.
+* **Main Deliverables:**
+  * `ProcessProvider` trait in `crates/aurora-ai/src/provider.rs`: abstraction for process enumeration with mock implementation (`MockProcessProvider`) tracking invocation count and limit bounds.
+  * `LinuxProcFsProcessProvider`: prototype provider inspecting `/proc` directly via Rust standard library filesystem APIs without spawning subshells or executing external utilities (`ps`, `pgrep`, `top`).
+  * Minimal & Confined Metadata: Discovers numeric PIDs, extracts executable basename from `/proc/<pid>/comm`, and resident memory from `/proc/<pid>/status` (`VmRSS:` in binary MiB). Prohibits reading command-line arguments (`cmdline`), environment variables (`environ`), or file descriptors.
+  * Resilient Enumeration: Ephemeral processes that exit or have permission restrictions during directory traversal are skipped gracefully without failing the request; systemic `/proc` unmount/permission failures return an explicit `IO_ERROR`.
+  * Deterministic Sorting & Bounding: Results are sorted deterministically in ascending order by PID and truncated to the validated limit ($1 \le \text{limit} \le 50$, default 10).
+  * Omission of `cpu_percent`: Documented technical rationale that a single snapshot provides cumulative clock ticks rather than an instantaneous percentage, omitting it to prevent misleading telemetry in a stateless observation capability.
+  * Parameter Enforcement: Registry strictly validates `limit` ($1 \le \text{limit} \le 50$), rejecting non-integers, out-of-range values, unexpected fields, and unsupported types before provider invocation.
+  * Dispatcher integration in `crates/aurora-ai/src/dispatcher.rs`: extracts validated limit (or default 10) without silent clamping; gated behind `PolicyDecision::Allow`.
+  * Worker stub integration in `worker/main.py`: handles process queries ("process", "ps", "task"), proposes `proc.list`, and synthesizes summary upon success.
+  * CLI flag support in `crates/aurora-ai/src/main.rs`: permits `--request "list processes"` on authorized runs.
+* **Verification Performed:**
+  * Unit tests in `crates/aurora-ai/src/provider.rs`: synthetic `/proc` tree parsing, comm extraction, VmRSS conversion, PID ascending sort, limit truncation, inaccessible directory `IO_ERROR`, and mock counting.
+  * Parameter tests in `crates/aurora-ai/src/capability.rs`: rejection of `limit = 0`, `limit = -5`, `limit = 51`, `"ten"`, floats, unexpected fields, and non-object inputs.
+  * Integration tests in `crates/aurora-ai/tests/m6b_process_capability_tests.rs` (13 tests):
+    1. Authorized proposal succeeds with bounded results and PID ascending sort.
+    2. Default limit of 10 applied when parameter is omitted or empty.
+    3. Unauthorized proposal denied with `PERMISSION_DENIED` and provider count 0.
+    4. Anonymous caller proposal denied with provider count 0.
+    5. Invalid limit rejected before provider execution with count 0.
+    6. Unexpected parameter rejected before provider execution with count 0.
+    7. Unsupported parameter types rejected before provider execution with count 0.
+    8. Provider failure (`IO_ERROR`) cleanly distinguished from authorization denial.
+    9. Supervisor turn integration enforces authorization before execution.
+    10. Real Linux `/proc` provider integration test on host.
+    11. Authorized end-to-end flow with worker synthesis.
+    12. Unauthorized end-to-end flow denied with provider invocation count 0.
+    13. Real host telemetry end-to-end execution.
+  * Python unit & integration tests in `worker/test_worker.py`: process prompt synthesis, regex word boundary intent matching, and response validation.
+  * Full regression run: 111 Rust tests + 16 Python tests passing.
+* **Relevant Code:**
+  * Provider: `crates/aurora-ai/src/provider.rs`
+  * Registry: `crates/aurora-ai/src/capability.rs`
+  * Dispatcher: `crates/aurora-ai/src/dispatcher.rs`
+  * Tests: `crates/aurora-ai/tests/m6b_process_capability_tests.rs`, `worker/test_worker.py`
 
 ---
 
