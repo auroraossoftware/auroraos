@@ -70,6 +70,15 @@ All capabilities must be registered in `CapabilityRegistry` and granted to the a
 | **`proc.list`** | `limit`: Integer in $[1, 1000]$ (default: 100). | `ProcListProvider` (scans `/proc/[0-9]+/stat`) | `PolicyEngine::evaluate` validates `limit` range and caller grant. | `PERMISSION_DENIED` |
 | **`fs.file.read`** | `path`: Relative or absolute path.<br>`offset`: Unsigned integer $\ge 0$.<br>`length`: Integer in $[1, 65536]$. | `FsFileReadProvider` (`openat2` + `pread`) | `PolicyEngine::evaluate` validates component containment within sandbox root and caller grant. | `PERMISSION_DENIED` |
 
+#### Semantic Boundary: `sys.cpu.read` Cumulative Metrics vs. Instantaneous Utilization
+* **Cumulative Boot-to-Now Semantics:** The percentages returned by `sys.cpu.read` (`user_percent`, `system_percent`, and `idle_percent`) are calculated from a single stateless snapshot of `/proc/stat` cumulative clock tick counters since system boot. They represent lifetime aggregate proportions from boot to the current moment, **not** instantaneous utilization or short-term load.
+* **Denominator Composition & Non-100% Sum:** In `crates/aurora-ai/src/provider.rs`, the denominator `total_ticks` is computed as:
+  $$\text{total\_ticks} = \text{user} + \text{nice} + \text{system} + \text{idle} + \text{iowait} + \text{irq} + \text{softirq} + \text{steal}$$
+  The three reported fields account only for `(user + nice)`, `(system + irq + softirq)`, and `idle`. Because `iowait` and `steal` are included in the denominator but excluded from the reported percentage categories, their sum:
+  $$\text{user\_percent} + \text{system\_percent} + \text{idle\_percent} \le 100.0\%$$
+  does **not** necessarily equal 100.0% when I/O wait or hypervisor steal ticks have elapsed.
+* **Instantaneous Measurement Requirement:** Accurately measuring instantaneous CPU utilization requires taking multiple distinct counter snapshots across an elapsed time interval ($\Delta t$) and computing tick deltas ($\Delta \text{ticks}$). This capability prototype performs a single-snapshot cumulative read; interval-based instantaneous sampling is not implemented.
+
 ---
 
 ### 2.3 Parameter Validation Error Semantics: ADR-002 Alignment & Redundant Code
@@ -216,15 +225,18 @@ pub fn socket_path(&self) -> PathBuf {
 
 #### Behavior Under Abrupt Termination:
 1. **Default Mode (PID-based path):**
-   * The default socket path includes the current process ID (`/tmp/aurora-ai-{PID}.sock`).
-   * If the daemon terminates abruptly (via `SIGKILL`, `SIGINT`, or unhandled `SIGTERM`), the socket file remains as an orphaned inode in `/tmp`.
-   * However, because the next invocation of the daemon runs under a new process ID, **the orphaned socket does not block subsequent ordinary startups**.
+   * The default socket path is constructed via `std::env::temp_dir()` and the current process ID (`aurora-ai-{PID}.sock`). While this often resolves under `/tmp` on standard Linux configurations, the actual temporary directory depends on environment variables (`$TMPDIR`, `$TEMP`, or container-specific mounts).
+   * Normal clean shutdown unlinks and removes the socket file from disk. However, if the daemon terminates abruptly (via `SIGKILL`, unhandled signal, or process panic), the socket file remains as an orphaned entry in the temporary directory.
+   * PID-based naming avoids bind collisions between immediate sequential or concurrent daemon launches that have different process IDs.
+   * However, PID-based naming does **not** eliminate stale-file accumulation on the filesystem over time.
+   * Furthermore, because operating systems allocate process IDs from a finite space, eventual PID recycling can result in a new daemon invocation receiving a PID that corresponds to an existing stale socket file, causing `UnixListener::bind` to fail with `EADDRINUSE`.
 2. **Fixed Mode (`--socket-path` CLI override):**
    * When an operator provides an explicit fixed path (e.g., `--socket-path /run/aurora/ai.sock`), abrupt process termination leaves the socket file on disk.
-   * On subsequent startup, `UnixListener::bind` fails with `EADDRINUSE` (Address already in use), blocking startup until manual administrative intervention.
-3. **Approved Decision (M9 Deferral):**
+   * On subsequent startup, `UnixListener::bind` fails immediately with `EADDRINUSE` (Address already in use), blocking startup until manual administrative intervention.
+3. **Approved Decision (M9 Deferral) & Scope of Proposed ADR-003:**
    * Signal-driven cleanup (`signal-hook` / async signal handlers) for fixed paths is **deferred to Milestone 9**.
-   * The long-term architectural resolution is the transition to anonymous `socketpair` IPC (ADR-003), which completely eliminates filesystem socket paths and their associated stale-inode failure modes.
+   * The long-term architectural resolution is the transition to anonymous `socketpair` IPC, as proposed in ADR-003, which will completely eliminate filesystem socket paths, filesystem race conditions, and stale-inode failure modes for worker IPC.
+   * However, ADR-003 remains strictly **Proposed**; these filesystem-path risks are not eliminated until anonymous socket-pair transport is implemented in Milestone 9.
 
 ---
 
@@ -253,3 +265,95 @@ pub fn socket_path(&self) -> PathBuf {
    * **ADR-003 Adoption:** Implement anonymous `socketpair(AF_UNIX, SOCK_STREAM, 0)` IPC transport, deprecating filesystem socket paths for internal worker communication.
    * **Worker Supervision & Restart:** Implement automatic worker restart capability conforming to ADR-001 Section 4 over the new socketpair channel.
    * **Signal-Driven Cleanup:** Implement signal handling for fixed daemon listeners or complete transition to systemd socket activation.
+
+---
+
+## 8. Authoritative Tracked Risk, Boundary, Caveat & Deferral Inventory
+
+### 8.1 Inventory Reconciliation
+Prior interim discussion summaries colloquially cited a count of 13 items. An exhaustive, formal cross-subsystem audit across architecture decision records, threat-model specifications, capability implementations, and benchmark baselines establishes an authoritative count of **exactly 16 tracked risk, boundary, caveat, and deferral items**.
+
+Every item below is distinct, non-overlapping, and cross-referenced to its primary repository documentation.
+
+### 8.2 Tracked Item Catalog
+
+| # | Item Name | Category | Current Status | Primary References |
+| :-: | :--- | :--- | :--- | :--- |
+| **1** | Worker Ambient OS Authority | Security & Containment Boundary | Tracked / Future Milestone | `docs/roadmap.md` §1.3, `docs/audit-m8.md` §4.2 |
+| **2** | Hard-Link Inode Sharing Limitation | Security & Filesystem Boundary | Tracked / Operational Boundary | `docs/roadmap.md` §1.5, `docs/audit-m8.md` §4.2 |
+| **3** | Deferred Public IPC & Caller Authentication | Architectural Boundary & Deferral | Tracked / Future Milestone | `docs/roadmap.md` §1.2, `docs/audit-m8.md` §2.2 |
+| **4** | Directory Permission Dependency (`0700`) | Security & Operational Boundary | Tracked / Operational Requirement | `docs/roadmap.md` §1.5, ADR-003 §1 |
+| **5** | Post-Bind Ownership-Capture Race | Filesystem Socket Concurrency Race | Tracked / Architectural Race (Proposed ADR-003) | `docs/roadmap.md` §1.5, ADR-003 §1 |
+| **6** | Shutdown Check-Then-Unlink Race | Filesystem Socket Concurrency Race | Tracked / Architectural Race (Proposed ADR-003) | `docs/roadmap.md` §1.5, ADR-003 §1 |
+| **7** | Fixed-Path Stale Socket Blockage | Process Lifecycle & Operational Deferral | Tracked / Deferred to M9 | `docs/audit-m8.md` §5.2, `docs/roadmap.md` §1.5 |
+| **8** | PID-Based Socket Accumulation & Reuse Collision | Process Lifecycle & Filesystem Boundary | Tracked / Environmental Limitation | `docs/audit-m8.md` §5.2, `docs/roadmap.md` §1.5 |
+| **9** | Cumulative CPU-Tick Semantics of `sys.cpu.read` | Capability Semantics & Telemetry Boundary | Tracked / Documented Semantics | `docs/vertical-slice-prototype-design.md` §5.1, `docs/audit-m8.md` §2.2 |
+| **10** | Missing Worker Auto-Restart / Supervision Recovery | Architectural Discrepancy & Deferral | Tracked / Deferred to M9 | `docs/audit-m8.md` §3.4, `docs/roadmap.md` §3 M8 |
+| **11** | Redundant Dispatcher Parameter Validation Dead Code | Code Quality & Maintainability Caveat | Tracked / Defense-in-Depth Fallback | `docs/audit-m8.md` §2.3 |
+| **12** | Workspace-Wide Formatting Backlog | Code Quality & Maintenance Backlog | Tracked / Legacy Debt | `docs/roadmap.md` §3 M7/M8 |
+| **13** | Proposal Flood Side-Effect Non-Rollback | Protocol Reliability & Execution Boundary | Tracked / Inherent Protocol Boundary | `docs/audit-m8.md` §3.3 |
+| **14** | Deterministic Worker Stub vs. Neural Runtime Separation | Prototype Scope Limitation | Tracked / Prototype Design Boundary | `docs/roadmap.md` §1.1, `docs/performance-baselines-m8.md` §2.2 |
+| **15** | Finite RSS Profiling vs. Zero-Leak Formal Proof | Benchmark & Verification Caveat | Tracked / Empirical Observation | `docs/performance-baselines-m8.md` §4.2, `docs/audit-m8.md` §5.1 |
+| **16** | Tail Latency Variance Under Virtualized Hypervisor | Performance Baseline Caveat | Tracked / Environment Limitation | `docs/performance-baselines-m8.md` §3.2, `docs/benchmarks/m8_baseline.json` |
+
+---
+
+### 8.3 Detailed Item Breakdown
+
+#### Group A: Security & Kernel Containment Boundaries
+1. **Worker Ambient OS Authority (No OS-Level Sandboxing):**
+   * *Description:* The Python AI worker executes as a standard unprivileged child process sharing the daemon's UID without OS-level sandboxing (no user namespaces, mount namespaces, seccomp-bpf filters, or Landlock LSM rules).
+   * *Risk Boundary:* While capability proposals are strictly mediated at the daemon's dispatcher boundary, the worker process retains the ambient OS authority of its executing UID and could directly access world-readable files or shared same-UID directories via native syscalls. Full isolation requires dedicated OS sandboxing in future milestones.
+2. **Hard-Link Inode Sharing Limitation:**
+   * *Description:* `openat2` resolution flags (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`) prevent path traversal and symlink escapes, but cannot prevent opening pre-existing hard links that reside within the sandbox root and point to external inodes.
+   * *Risk Boundary:* Sandbox boundaries require administrative hygiene to ensure the sandbox root does not contain pre-existing hard links to sensitive external files.
+3. **Deferred Public IPC & Production Caller Authentication:**
+   * *Description:* Public D-Bus IPC, system bus interfaces, and production caller authorization mechanisms (e.g., Polkit integration, bus credentials) are deliberately deferred.
+   * *Risk Boundary:* Callers in the vertical slice are represented via internal principal abstractions (`CallerIdentity`) and CLI flags. Production multi-user authentication is not yet implemented.
+4. **Directory Permission Dependency (`0700`):**
+   * *Description:* Security of path-based Unix domain sockets against other unprivileged system UIDs depends on operating within a private directory with mode `0700` owned by the daemon user.
+   * *Risk Boundary:* The daemon does not create or validate parent directory permissions in code. It relies on operational deployment hygiene, which protects against cross-UID access but provides no defense against processes sharing the daemon's own UID.
+
+#### Group B: Filesystem Socket Lifecycle & Concurrency Races
+5. **Post-Bind Ownership-Capture Race:**
+   * *Description:* On shared filesystem paths, a TOCTOU race exists between `UnixListener::bind(&path)` returning and `symlink_metadata(&path)` reading the host filesystem inode.
+   * *Risk Boundary:* A concurrent same-UID process could unlink the newly bound socket and substitute another filesystem object before `symlink_metadata` executes, causing the daemon to record the replacement's inode.
+6. **Shutdown Check-Then-Unlink Race:**
+   * *Description:* On shared filesystem paths, a TOCTOU race exists between `symlink_metadata(&path)` checking the socket inode on shutdown and `std::fs::remove_file(&path)` executing `unlink()`.
+   * *Risk Boundary:* A concurrent same-UID process could replace the socket with another file after the metadata check, causing the daemon to unlink the replacement file. Linux provides no atomic `unlink_if_matches` syscall.
+7. **Fixed-Path Stale Socket Blockage Under Abrupt Termination:**
+   * *Description:* When an operator configures an explicit fixed path via `--socket-path`, abrupt process termination (`SIGKILL`, unhandled signal, crash) leaves an orphaned socket file on disk.
+   * *Risk Boundary:* Subsequent daemon startup fails immediately with `EADDRINUSE` until manual administrative intervention unlinks the stale socket file. Signal-driven cleanup is deferred to M9.
+8. **PID-Based Socket Accumulation & Eventual PID Reuse Collision:**
+   * *Description:* Default socket paths are constructed using `std::env::temp_dir()` and the process ID (`aurora-ai-{PID}.sock`), resolving typically to `/tmp`. Abrupt termination leaves orphaned socket files in the temporary directory.
+   * *Risk Boundary:* While PID-based naming prevents collisions between immediate launches with different PIDs, stale files accumulate over time. Because the OS PID space is finite, eventual PID recycling can result in a new daemon invocation receiving a PID that corresponds to an existing stale socket file, causing `bind` to fail with `EADDRINUSE`. Proposed ADR-003 will eliminate this when implemented in M9, but remains Proposed today.
+
+#### Group C: Capability Semantics & Telemetry Boundaries
+9. **Cumulative CPU-Tick Semantics of `sys.cpu.read`:**
+   * *Description:* Metrics returned by `sys.cpu.read` (`user_percent`, `system_percent`, `idle_percent`) are computed from a single stateless snapshot of `/proc/stat` cumulative clock ticks since system boot.
+   * *Risk Boundary:* The values represent boot-to-now lifetime shares, not instantaneous utilization. The denominator includes `iowait` and `steal`, while the three reported categories omit them, so their sum does not necessarily equal 100.0%. Instantaneous load calculation requires multi-sample interval measurement, which is not implemented in this prototype.
+
+#### Group D: Process Supervision, Lifecycle & Deferrals
+10. **Missing Worker Auto-Restart / Supervision Recovery:**
+    * *Description:* ADR-001 Section 4 envisioned that unhealthy workers would be terminated and automatically restarted by the daemon supervisor.
+    * *Risk Boundary:* The current implementation detects failures and fails closed, dropping IPC channels and returning errors without restarting the worker. Automatic worker restart is deferred to M9 alongside anonymous socketpair transport.
+11. **Redundant Dispatcher Parameter Validation Dead Code:**
+    * *Description:* `CapabilityDispatcher` contains fallback `match` deserialization branches that return `INVALID_ARGUMENT`.
+    * *Risk Boundary:* Because `PolicyEngine::evaluate` validates parameter syntax and scope upstream and returns `PERMISSION_DENIED` per ADR-002 §3.4/§3.10, these dispatcher fallback branches are unreachable dead code in normal operation.
+12. **Workspace-Wide Formatting Backlog:**
+    * *Description:* Legacy Rust source files from M1–M6b do not conform to `cargo fmt --all -- --check`.
+    * *Risk Boundary:* Workspace-wide automated formatting cannot be enforced in CI without massive churn across historical commits. Formatting enforcement is strictly targeted to new and modified M7/M8 files.
+
+#### Group E: Protocol Reliability, Performance & Verification Caveats
+13. **Proposal Flood Side-Effect Non-Rollback:**
+    * *Description:* The supervisor's proposal flood gate rejects the turn and terminates the IPC session immediately upon receipt of proposal 21 (pre-dispatch).
+    * *Risk Boundary:* Capability proposals 1–20 executed prior to the flood limit may have produced side effects or read system state. These prior effects cannot be rolled back upon session termination.
+14. **Deterministic Worker Stub vs. Neural Runtime Separation:**
+    * *Description:* The AI worker stub uses deterministic rule-based mappings to simulate reasoning.
+    * *Risk Boundary:* No real LLM, neural network weights, tokenizer, or inference runtime has been integrated. Real model latency, GPU memory footprint, and token streaming dynamics remain uncharacterized.
+15. **Finite RSS Profiling vs. Zero-Leak Formal Proof:**
+    * *Description:* Memory stability was sampled at checkpoints ($M_0, M_{50}, M_{100}, M_{500}, M_{1000}$) across 1,000 sustained turns.
+    * *Risk Boundary:* While empirical observation showed stable resident memory (2.7–2.9 MiB daemon, 16.2–16.3 MiB worker) without monotonic growth, finite-turn sampling is an empirical baseline, not a formal mathematical proof of zero long-term memory leakage.
+16. **Tail Latency Variance Under Virtualized Hypervisor:**
+    * *Description:* Turn latencies were benchmarked across 3 runs of 1,000 samples per scenario on virtualized hardware.
+    * *Risk Boundary:* Tail latencies ($p_{90}, p_{99}$) exhibit variability due to hypervisor CPU scheduling jitter, vCPU migration, and shared host VFS cache state. Microsecond-level baselines reflect the virtualized test environment.

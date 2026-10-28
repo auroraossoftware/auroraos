@@ -158,11 +158,15 @@ The vertical slice implements exactly four narrow, general primitives:
 
 ### 1. `sys.cpu.read`
 * **Input Schema:** None (empty object `{}`).
-* **Output Schema:** `{ "user_percent": float, "system_percent": float, "idle_percent": float }`
-* **Scope:** Host system-wide CPU metrics.
+* **Output Schema:** `{ "user_percent": float, "system_percent": float, "idle_percent": float, "total_ticks": integer, "idle_ticks": integer }`
+* **Scope:** Host system-wide cumulative CPU metrics since boot.
 * **Side Effects:** None (pure read-only observation).
 * **Sensitivity:** Low (Tier 0 observation).
 * **Authorization Requirements:** Permitted for authenticated local user sessions.
+* **Semantics & Calculation Boundaries:**
+  * **Cumulative Boot-to-Now Shares:** The returned `user_percent`, `system_percent`, and `idle_percent` are calculated from cumulative `/proc/stat` clock tick counters since host system boot. They represent aggregate lifetime shares across the machine's running duration, **not** instantaneous or interval utilization.
+  * **Denominator Composition:** The denominator (`total_ticks`) includes `user`, `nice`, `system`, `idle`, `iowait`, `irq`, `softirq`, and `steal`. In contrast, the three percentage fields report only `(user + nice)`, `(system + irq + softirq)`, and `idle`. Because `iowait` and `steal` are included in the denominator but excluded from the reported percentage categories, their sum (`user_percent + system_percent + idle_percent`) does not necessarily equal 100.0%.
+  * **Instantaneous Utilization Requirement:** Computing instantaneous utilization requires acquiring multiple counter snapshots over an elapsed time interval ($\Delta t$) and calculating tick deltas ($\Delta \text{ticks}$). This capability prototype performs a single-snapshot cumulative read; interval-based instantaneous sampling is not implemented.
 
 ### 2. `sys.memory.read`
 * **Input Schema:** None (empty object `{}`).
