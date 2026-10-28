@@ -18,6 +18,8 @@ pub struct SupervisorConfig {
     pub handshake_timeout: Duration,
     /// Read/write timeout on the established IPC socket.
     pub socket_timeout: Duration,
+    /// Maximum number of capability proposals permitted in a single turn (defaults to 20).
+    pub max_proposals_per_turn: usize,
 }
 
 impl Default for SupervisorConfig {
@@ -36,6 +38,7 @@ impl Default for SupervisorConfig {
             demo_sandbox_path,
             handshake_timeout: Duration::from_secs(5),
             socket_timeout: Duration::from_secs(5),
+            max_proposals_per_turn: 20,
         }
     }
 }
@@ -50,6 +53,12 @@ impl SupervisorConfig {
     /// Sets custom worker command.
     pub fn with_worker_command(mut self, cmd: Vec<String>) -> Self {
         self.worker_command = cmd;
+        self
+    }
+
+    /// Sets custom working directory for worker spawn.
+    pub fn with_working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
         self
     }
 
@@ -68,6 +77,12 @@ impl SupervisorConfig {
     /// Sets read/write timeout on the established IPC socket (testability convenience).
     pub fn with_socket_timeout(mut self, timeout: Duration) -> Self {
         self.socket_timeout = timeout;
+        self
+    }
+
+    /// Sets maximum number of capability proposals permitted in a single turn.
+    pub fn with_max_proposals_per_turn(mut self, max: usize) -> Self {
+        self.max_proposals_per_turn = max;
         self
     }
 }

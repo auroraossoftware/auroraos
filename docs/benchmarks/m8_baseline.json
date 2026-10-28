@@ -1,0 +1,612 @@
+{
+  "environment_metadata": {
+    "cpu_arch": "x86_64",
+    "cpu_cores": 2,
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "cpu_scaling_governor": "unsupported / virtualized",
+    "kernel_release": "6.8.0-1064-azure",
+    "os_distribution": "Ubuntu 24.04.4 LTS",
+    "python_version": "Python 3.14.2",
+    "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)"
+  },
+  "runs": [
+    {
+      "memory_profile": [
+        {
+          "checkpoint": "M0_quiescent",
+          "daemon_vmhwm_kib": 2736,
+          "daemon_vmrss_kib": 2736,
+          "daemon_vmsize_kib": 3648,
+          "turn_count": 0,
+          "worker_vmhwm_kib": 16256,
+          "worker_vmrss_kib": 16256,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M50_post_warmup",
+          "daemon_vmhwm_kib": 2736,
+          "daemon_vmrss_kib": 2736,
+          "daemon_vmsize_kib": 3648,
+          "turn_count": 50,
+          "worker_vmhwm_kib": 16256,
+          "worker_vmrss_kib": 16256,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M100_turns",
+          "daemon_vmhwm_kib": 2736,
+          "daemon_vmrss_kib": 2736,
+          "daemon_vmsize_kib": 3648,
+          "turn_count": 100,
+          "worker_vmhwm_kib": 16256,
+          "worker_vmrss_kib": 16256,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M500_turns",
+          "daemon_vmhwm_kib": 2736,
+          "daemon_vmrss_kib": 2736,
+          "daemon_vmsize_kib": 3648,
+          "turn_count": 500,
+          "worker_vmhwm_kib": 16256,
+          "worker_vmrss_kib": 16256,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M1000_turns",
+          "daemon_vmhwm_kib": 2736,
+          "daemon_vmrss_kib": 2736,
+          "daemon_vmsize_kib": 3648,
+          "turn_count": 1000,
+          "worker_vmhwm_kib": 16256,
+          "worker_vmrss_kib": 16256,
+          "worker_vmsize_kib": 23692
+        }
+      ],
+      "run_index": 1,
+      "scenarios": [
+        {
+          "cv_percent": 26.47,
+          "iqr_ms": 0.0174,
+          "max_ms": 0.139,
+          "mean_ms": 0.0587,
+          "min_ms": 0.04,
+          "p50_ms": 0.0526,
+          "p90_ms": 0.0807,
+          "p99_ms": 0.115,
+          "sample_count": 1000,
+          "scenario_name": "noop",
+          "stddev_ms": 0.0155,
+          "throughput_turns_per_sec": 16943.15,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 73.31,
+          "iqr_ms": 0.0787,
+          "max_ms": 2.9094,
+          "mean_ms": 0.214,
+          "min_ms": 0.1409,
+          "p50_ms": 0.2021,
+          "p90_ms": 0.2637,
+          "p99_ms": 0.7589,
+          "sample_count": 1000,
+          "scenario_name": "sys.cpu.read",
+          "stddev_ms": 0.1569,
+          "throughput_turns_per_sec": 4667.67,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 22.6,
+          "iqr_ms": 0.0623,
+          "max_ms": 0.7543,
+          "mean_ms": 0.1877,
+          "min_ms": 0.1288,
+          "p50_ms": 0.1974,
+          "p90_ms": 0.2361,
+          "p99_ms": 0.2881,
+          "sample_count": 1000,
+          "scenario_name": "sys.memory.read",
+          "stddev_ms": 0.0424,
+          "throughput_turns_per_sec": 5320.75,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 15.83,
+          "iqr_ms": 0.172,
+          "max_ms": 2.2892,
+          "mean_ms": 1.2673,
+          "min_ms": 1.0301,
+          "p50_ms": 1.2217,
+          "p90_ms": 1.5992,
+          "p99_ms": 1.8755,
+          "sample_count": 1000,
+          "scenario_name": "proc.list_limit_10",
+          "stddev_ms": 0.2006,
+          "throughput_turns_per_sec": 788.95,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 14.2,
+          "iqr_ms": 0.1272,
+          "max_ms": 2.9832,
+          "mean_ms": 1.1952,
+          "min_ms": 1.0554,
+          "p50_ms": 1.1493,
+          "p90_ms": 1.4137,
+          "p99_ms": 1.7478,
+          "sample_count": 1000,
+          "scenario_name": "proc.list_limit_50",
+          "stddev_ms": 0.1698,
+          "throughput_turns_per_sec": 836.51,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 25.22,
+          "iqr_ms": 0.0608,
+          "max_ms": 0.84,
+          "mean_ms": 0.1741,
+          "min_ms": 0.1254,
+          "p50_ms": 0.1755,
+          "p90_ms": 0.2262,
+          "p99_ms": 0.2707,
+          "sample_count": 1000,
+          "scenario_name": "fs.file.read_128b",
+          "stddev_ms": 0.0439,
+          "throughput_turns_per_sec": 5736.51,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 12.75,
+          "iqr_ms": 0.0494,
+          "max_ms": 0.8955,
+          "mean_ms": 0.4151,
+          "min_ms": 0.3318,
+          "p50_ms": 0.4066,
+          "p90_ms": 0.4626,
+          "p99_ms": 0.5974,
+          "sample_count": 1000,
+          "scenario_name": "fs.file.read_64kib",
+          "stddev_ms": 0.0529,
+          "throughput_turns_per_sec": 2407.59,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 24.52,
+          "iqr_ms": 0.0364,
+          "max_ms": 0.3056,
+          "mean_ms": 0.129,
+          "min_ms": 0.0945,
+          "p50_ms": 0.1144,
+          "p90_ms": 0.174,
+          "p99_ms": 0.2287,
+          "sample_count": 1000,
+          "scenario_name": "policy_denial",
+          "stddev_ms": 0.0316,
+          "throughput_turns_per_sec": 7743.99,
+          "warmup_count": 50
+        }
+      ]
+    },
+    {
+      "memory_profile": [
+        {
+          "checkpoint": "M0_quiescent",
+          "daemon_vmhwm_kib": 2884,
+          "daemon_vmrss_kib": 2884,
+          "daemon_vmsize_kib": 3740,
+          "turn_count": 0,
+          "worker_vmhwm_kib": 16288,
+          "worker_vmrss_kib": 16288,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M50_post_warmup",
+          "daemon_vmhwm_kib": 2884,
+          "daemon_vmrss_kib": 2884,
+          "daemon_vmsize_kib": 3740,
+          "turn_count": 50,
+          "worker_vmhwm_kib": 16288,
+          "worker_vmrss_kib": 16288,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M100_turns",
+          "daemon_vmhwm_kib": 2884,
+          "daemon_vmrss_kib": 2884,
+          "daemon_vmsize_kib": 3740,
+          "turn_count": 100,
+          "worker_vmhwm_kib": 16288,
+          "worker_vmrss_kib": 16288,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M500_turns",
+          "daemon_vmhwm_kib": 2884,
+          "daemon_vmrss_kib": 2884,
+          "daemon_vmsize_kib": 3740,
+          "turn_count": 500,
+          "worker_vmhwm_kib": 16288,
+          "worker_vmrss_kib": 16288,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M1000_turns",
+          "daemon_vmhwm_kib": 2884,
+          "daemon_vmrss_kib": 2884,
+          "daemon_vmsize_kib": 3740,
+          "turn_count": 1000,
+          "worker_vmhwm_kib": 16288,
+          "worker_vmrss_kib": 16288,
+          "worker_vmsize_kib": 23692
+        }
+      ],
+      "run_index": 2,
+      "scenarios": [
+        {
+          "cv_percent": 26.13,
+          "iqr_ms": 0.0169,
+          "max_ms": 0.1274,
+          "mean_ms": 0.0607,
+          "min_ms": 0.0399,
+          "p50_ms": 0.0554,
+          "p90_ms": 0.0835,
+          "p99_ms": 0.1122,
+          "sample_count": 1000,
+          "scenario_name": "noop",
+          "stddev_ms": 0.0159,
+          "throughput_turns_per_sec": 16373.03,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 18.32,
+          "iqr_ms": 0.0587,
+          "max_ms": 0.4748,
+          "mean_ms": 0.2045,
+          "min_ms": 0.1479,
+          "p50_ms": 0.211,
+          "p90_ms": 0.2508,
+          "p99_ms": 0.298,
+          "sample_count": 1000,
+          "scenario_name": "sys.cpu.read",
+          "stddev_ms": 0.0375,
+          "throughput_turns_per_sec": 4884.62,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 36.66,
+          "iqr_ms": 0.0665,
+          "max_ms": 1.9576,
+          "mean_ms": 0.1889,
+          "min_ms": 0.1337,
+          "p50_ms": 0.1848,
+          "p90_ms": 0.246,
+          "p99_ms": 0.2861,
+          "sample_count": 1000,
+          "scenario_name": "sys.memory.read",
+          "stddev_ms": 0.0693,
+          "throughput_turns_per_sec": 5288.27,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 13.91,
+          "iqr_ms": 0.1076,
+          "max_ms": 4.3741,
+          "mean_ms": 1.2017,
+          "min_ms": 1.0442,
+          "p50_ms": 1.1694,
+          "p90_ms": 1.3495,
+          "p99_ms": 1.7846,
+          "sample_count": 1000,
+          "scenario_name": "proc.list_limit_10",
+          "stddev_ms": 0.1672,
+          "throughput_turns_per_sec": 831.99,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 27.87,
+          "iqr_ms": 0.2001,
+          "max_ms": 9.8946,
+          "mean_ms": 1.2693,
+          "min_ms": 1.0572,
+          "p50_ms": 1.1955,
+          "p90_ms": 1.5485,
+          "p99_ms": 1.9617,
+          "sample_count": 1000,
+          "scenario_name": "proc.list_limit_50",
+          "stddev_ms": 0.3538,
+          "throughput_turns_per_sec": 787.68,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 25.24,
+          "iqr_ms": 0.0545,
+          "max_ms": 0.8148,
+          "mean_ms": 0.163,
+          "min_ms": 0.1233,
+          "p50_ms": 0.1437,
+          "p90_ms": 0.2132,
+          "p99_ms": 0.2694,
+          "sample_count": 1000,
+          "scenario_name": "fs.file.read_128b",
+          "stddev_ms": 0.0411,
+          "throughput_turns_per_sec": 6127.75,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 12.64,
+          "iqr_ms": 0.0795,
+          "max_ms": 0.7886,
+          "mean_ms": 0.4706,
+          "min_ms": 0.3987,
+          "p50_ms": 0.454,
+          "p90_ms": 0.5446,
+          "p99_ms": 0.6758,
+          "sample_count": 1000,
+          "scenario_name": "fs.file.read_64kib",
+          "stddev_ms": 0.0595,
+          "throughput_turns_per_sec": 2124.04,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 20.69,
+          "iqr_ms": 0.0478,
+          "max_ms": 0.2728,
+          "mean_ms": 0.1511,
+          "min_ms": 0.097,
+          "p50_ms": 0.1602,
+          "p90_ms": 0.1871,
+          "p99_ms": 0.2344,
+          "sample_count": 1000,
+          "scenario_name": "policy_denial",
+          "stddev_ms": 0.0313,
+          "throughput_turns_per_sec": 6612.65,
+          "warmup_count": 50
+        }
+      ]
+    },
+    {
+      "memory_profile": [
+        {
+          "checkpoint": "M0_quiescent",
+          "daemon_vmhwm_kib": 2944,
+          "daemon_vmrss_kib": 2888,
+          "daemon_vmsize_kib": 3756,
+          "turn_count": 0,
+          "worker_vmhwm_kib": 16308,
+          "worker_vmrss_kib": 16308,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M50_post_warmup",
+          "daemon_vmhwm_kib": 2944,
+          "daemon_vmrss_kib": 2888,
+          "daemon_vmsize_kib": 3756,
+          "turn_count": 50,
+          "worker_vmhwm_kib": 16308,
+          "worker_vmrss_kib": 16308,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M100_turns",
+          "daemon_vmhwm_kib": 2944,
+          "daemon_vmrss_kib": 2888,
+          "daemon_vmsize_kib": 3756,
+          "turn_count": 100,
+          "worker_vmhwm_kib": 16308,
+          "worker_vmrss_kib": 16308,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M500_turns",
+          "daemon_vmhwm_kib": 2944,
+          "daemon_vmrss_kib": 2888,
+          "daemon_vmsize_kib": 3756,
+          "turn_count": 500,
+          "worker_vmhwm_kib": 16308,
+          "worker_vmrss_kib": 16308,
+          "worker_vmsize_kib": 23692
+        },
+        {
+          "checkpoint": "M1000_turns",
+          "daemon_vmhwm_kib": 2944,
+          "daemon_vmrss_kib": 2888,
+          "daemon_vmsize_kib": 3756,
+          "turn_count": 1000,
+          "worker_vmhwm_kib": 16308,
+          "worker_vmrss_kib": 16308,
+          "worker_vmsize_kib": 23692
+        }
+      ],
+      "run_index": 3,
+      "scenarios": [
+        {
+          "cv_percent": 54.31,
+          "iqr_ms": 0.0263,
+          "max_ms": 1.1745,
+          "mean_ms": 0.0733,
+          "min_ms": 0.0425,
+          "p50_ms": 0.0753,
+          "p90_ms": 0.0938,
+          "p99_ms": 0.1313,
+          "sample_count": 1000,
+          "scenario_name": "noop",
+          "stddev_ms": 0.0398,
+          "throughput_turns_per_sec": 13561.51,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 19.4,
+          "iqr_ms": 0.0666,
+          "max_ms": 0.4299,
+          "mean_ms": 0.201,
+          "min_ms": 0.14,
+          "p50_ms": 0.2124,
+          "p90_ms": 0.2522,
+          "p99_ms": 0.2894,
+          "sample_count": 1000,
+          "scenario_name": "sys.cpu.read",
+          "stddev_ms": 0.039,
+          "throughput_turns_per_sec": 4969.08,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 21.58,
+          "iqr_ms": 0.0617,
+          "max_ms": 0.3156,
+          "mean_ms": 0.1827,
+          "min_ms": 0.135,
+          "p50_ms": 0.1722,
+          "p90_ms": 0.2405,
+          "p99_ms": 0.2907,
+          "sample_count": 1000,
+          "scenario_name": "sys.memory.read",
+          "stddev_ms": 0.0394,
+          "throughput_turns_per_sec": 5469.18,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 9.31,
+          "iqr_ms": 0.0814,
+          "max_ms": 1.7568,
+          "mean_ms": 1.137,
+          "min_ms": 1.0447,
+          "p50_ms": 1.0996,
+          "p90_ms": 1.2491,
+          "p99_ms": 1.6109,
+          "sample_count": 1000,
+          "scenario_name": "proc.list_limit_10",
+          "stddev_ms": 0.1058,
+          "throughput_turns_per_sec": 879.35,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 13.4,
+          "iqr_ms": 0.1255,
+          "max_ms": 2.2403,
+          "mean_ms": 1.2665,
+          "min_ms": 1.0586,
+          "p50_ms": 1.224,
+          "p90_ms": 1.4636,
+          "p99_ms": 1.9136,
+          "sample_count": 1000,
+          "scenario_name": "proc.list_limit_50",
+          "stddev_ms": 0.1698,
+          "throughput_turns_per_sec": 789.39,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 45.5,
+          "iqr_ms": 0.0753,
+          "max_ms": 1.9431,
+          "mean_ms": 0.1909,
+          "min_ms": 0.1264,
+          "p50_ms": 0.1941,
+          "p90_ms": 0.2397,
+          "p99_ms": 0.2973,
+          "sample_count": 1000,
+          "scenario_name": "fs.file.read_128b",
+          "stddev_ms": 0.0868,
+          "throughput_turns_per_sec": 5234.06,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 16.61,
+          "iqr_ms": 0.0928,
+          "max_ms": 0.9477,
+          "mean_ms": 0.5241,
+          "min_ms": 0.4025,
+          "p50_ms": 0.512,
+          "p90_ms": 0.6426,
+          "p99_ms": 0.8109,
+          "sample_count": 1000,
+          "scenario_name": "fs.file.read_64kib",
+          "stddev_ms": 0.087,
+          "throughput_turns_per_sec": 1907.18,
+          "warmup_count": 50
+        },
+        {
+          "cv_percent": 24.24,
+          "iqr_ms": 0.0594,
+          "max_ms": 0.2944,
+          "mean_ms": 0.1452,
+          "min_ms": 0.094,
+          "p50_ms": 0.149,
+          "p90_ms": 0.1892,
+          "p99_ms": 0.2267,
+          "sample_count": 1000,
+          "scenario_name": "policy_denial",
+          "stddev_ms": 0.0352,
+          "throughput_turns_per_sec": 6877.93,
+          "warmup_count": 50
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "aggregate_mean_ms": 0.0642,
+      "aggregate_p50_ms": 0.0611,
+      "aggregate_p90_ms": 0.086,
+      "aggregate_p99_ms": 0.1195,
+      "aggregate_throughput_turns_per_sec": 15625.9,
+      "scenario_name": "noop"
+    },
+    {
+      "aggregate_mean_ms": 0.2065,
+      "aggregate_p50_ms": 0.2085,
+      "aggregate_p90_ms": 0.2556,
+      "aggregate_p99_ms": 0.4488,
+      "aggregate_throughput_turns_per_sec": 4840.46,
+      "scenario_name": "sys.cpu.read"
+    },
+    {
+      "aggregate_mean_ms": 0.1864,
+      "aggregate_p50_ms": 0.1848,
+      "aggregate_p90_ms": 0.2409,
+      "aggregate_p99_ms": 0.2883,
+      "aggregate_throughput_turns_per_sec": 5359.4,
+      "scenario_name": "sys.memory.read"
+    },
+    {
+      "aggregate_mean_ms": 1.202,
+      "aggregate_p50_ms": 1.1636,
+      "aggregate_p90_ms": 1.3993,
+      "aggregate_p99_ms": 1.757,
+      "aggregate_throughput_turns_per_sec": 833.43,
+      "scenario_name": "proc.list_limit_10"
+    },
+    {
+      "aggregate_mean_ms": 1.2437,
+      "aggregate_p50_ms": 1.1896,
+      "aggregate_p90_ms": 1.4753,
+      "aggregate_p99_ms": 1.8744,
+      "aggregate_throughput_turns_per_sec": 804.53,
+      "scenario_name": "proc.list_limit_50"
+    },
+    {
+      "aggregate_mean_ms": 0.176,
+      "aggregate_p50_ms": 0.1711,
+      "aggregate_p90_ms": 0.2264,
+      "aggregate_p99_ms": 0.2791,
+      "aggregate_throughput_turns_per_sec": 5699.44,
+      "scenario_name": "fs.file.read_128b"
+    },
+    {
+      "aggregate_mean_ms": 0.4699,
+      "aggregate_p50_ms": 0.4575,
+      "aggregate_p90_ms": 0.5499,
+      "aggregate_p99_ms": 0.6947,
+      "aggregate_throughput_turns_per_sec": 2146.27,
+      "scenario_name": "fs.file.read_64kib"
+    },
+    {
+      "aggregate_mean_ms": 0.1418,
+      "aggregate_p50_ms": 0.1412,
+      "aggregate_p90_ms": 0.1834,
+      "aggregate_p99_ms": 0.2299,
+      "aggregate_throughput_turns_per_sec": 7078.19,
+      "scenario_name": "policy_denial"
+    }
+  ],
+  "timestamp": "2026-10-27T06:20:00Z"
+}

@@ -2,7 +2,7 @@
 
 * **Status:** Living Document
 * **Authoritative Architecture Context:** [ADR-001](decisions/0001-core-daemon-and-worker-runtime-architecture.md), [ADR-002](decisions/0002-capability-and-permission-architecture.md), and [Vertical Slice Prototype Design](vertical-slice-prototype-design.md)
-* **Current Progress:** Milestones 1–7 Complete (Milestone 8 next)
+* **Current Progress:** Milestones 1–8 Complete
 
 ---
 
@@ -34,7 +34,7 @@ The milestones documented below track prototype implementation progress against 
 | **M5** | Complete End-to-End Request Flow | **Complete** | Full vertical slice: caller -> daemon -> worker -> proposal -> policy -> provider -> outcome -> worker synthesis -> caller response. |
 | **M6** | Remaining MVP Capabilities | **Complete** | Implemented `sys.memory.read` (M6a), `proc.list` (M6b), and kernel-contained `fs.file.read` (M6c). |
 | **M7** | Security, Rejection & Fault Containment Tests | **Complete** (Reconciled Prototype Scope) | Adversarial test harness, non-destructive socket pre-checking, fail-closed invalidation, and documented threat-model boundaries. |
-| **M8** | Verification & Architecture Documentation Review | Planned | End-to-end audit, performance baselines, and architectural findings review. |
+| **M8** | System Audit & Performance Baselines | **Complete** | End-to-end audit, performance baselines, proposal flood protection, and proposed ADR-003. |
 
 ---
 
@@ -419,3 +419,50 @@ The milestones documented below track prototype implementation progress against 
   * Configuration: `crates/aurora-ai/src/config.rs`
   * Rust Tests: `crates/aurora-ai/tests/m7_adversarial_security_tests.rs`
   * Python Tests: `worker/test_adversarial.py`
+
+---
+
+### Milestone 8: System Audit & Performance Baselines
+* **Status:** Complete
+* **Purpose:** Execute comprehensive end-to-end audit, establish reproducible empirical performance and memory baselines, introduce turn-level proposal flood protection, formalize file-descriptor invariant testing under sustained streaming, evaluate parameter validation semantics against ADR-002, record explicit M9 deferrals (worker auto-restart and fixed-path signal handling), and draft proposed ADR-003 for anonymous socketpair IPC.
+* **Main Deliverables:**
+  * **Turn Proposal Flood Containment:**
+    * Introduced `max_proposals_per_turn: usize` in `SupervisorConfig` (defaulting to 20).
+    * Pre-dispatch counting immediately on receipt in `WorkerSupervisor::execute_turn_with_id`: rejects turn at proposal 21 with `TurnProposalLimitExceeded`, closes socket reader and writer, invalidates IPC session, and guarantees zero excess provider executions.
+  * **System Audit Report ([`docs/audit-m8.md`](audit-m8.md)):**
+    * Comprehensive audit of the end-to-end request pipeline, authorization invariants across all 4 capabilities, parameter validation error semantics (`PERMISSION_DENIED` compliance with ADR-002 §3.4/§3.10 and redundant dispatcher dead code), kernel filesystem boundaries (`openat2` flags vs. hard-link and ambient UID limits), file-descriptor leak verification, and stale-socket handling.
+    * Explicit documentation of worker restart discrepancy (ADR-001 §4 rationale) and deliberate deferral to M9 alongside socketpair IPC.
+    * Explicit documentation of fixed-path signal handling limitation under abrupt termination and deliberate deferral to M9.
+  * **Performance Baselines Report ([`docs/performance-baselines-m8.md`](performance-baselines-m8.md)) & Dataset ([`docs/benchmarks/m8_baseline.json`](benchmarks/m8_baseline.json)):**
+    * Automated benchmark harness (`crates/aurora-ai/benches/m8_baselines.rs`) exercising 8 scenarios (`noop`, `sys.cpu.read`, `sys.memory.read`, `proc.list(10)`, `proc.list(50)`, `fs.file.read(128B)`, `fs.file.read(64KiB)`, `policy_denial`).
+    * Evaluated across 3 independent cold-start runs with 50 warm-up turns and 1,000 timed samples per scenario (24,000 total recorded turns).
+    * Aggregate median turn latency: 0.061 ms (`noop`), 0.141 ms (`policy_denial`), 0.171 ms (`fs.file.read` 128B), 0.185 ms (`sys.memory.read`), 0.209 ms (`sys.cpu.read`), 0.458 ms (`fs.file.read` 64KiB), 1.164 ms (`proc.list` 10), 1.190 ms (`proc.list` 50).
+    * Live memory sampling via Linux procfs (`VmRSS`, `VmHWM`, `VmSize`) at checkpoints $M_0, M_{50}, M_{100}, M_{500}, M_{1000}$: daemon resident set stable at 2.7–2.9 MiB; worker stable at 16.2–16.3 MiB.
+  * **Proposed Architecture Decision Record ([ADR-003](decisions/0003-socketpair-ipc-transport.md)):**
+    * Drafted proposed ADR-003: *Anonymous Socketpair IPC Transport for Internal Worker Communication*, detailing transition to `socketpair(AF_UNIX, SOCK_STREAM, 0)`, descriptor inheritance, `O_CLOEXEC` hygiene, complete elimination of VFS pathname races and stale-socket leftovers, and protocol compatibility.
+    * Registered ADR-003 in [`docs/decisions/README.md`](decisions/README.md).
+  * **Audit Verification Test Suite (`crates/aurora-ai/tests/m8_audit_verification_tests.rs`):**
+    * 6 comprehensive integration tests verifying:
+      1. Multi-step capability chaining in a single turn (`sys.cpu.read` followed by `sys.memory.read`).
+      2. Turn proposal flood rejection at limit (proposal 21 rejected, session invalidated, provider called exactly 20 times).
+      3. Pre-dispatch accounting (unauthorized proposals count toward limit, 0 provider calls).
+      4. In-process descriptor leak invariance ($\Delta \mathcal{S}_{\text{daemon\_fd}} = \emptyset$ across 500 sustained stream turns).
+      5. Live external Python worker descriptor leak invariance ($\Delta \mathcal{S}_{\text{worker\_fd}} = \emptyset$ and $\Delta \mathcal{S}_{\text{daemon\_fd}} = \emptyset$ across 500 multi-capability turns cycling through `sys.cpu.read`, `sys.memory.read`, `proc.list`, and sandboxed `fs.file.read`, exercising the supervisor within the test process and worker as a separate child process).
+      6. Sustained memory observations across 1,000 turns at checkpoints $M_0, M_{50}, M_{100}, M_{500}, M_{1000}$.
+* **Verification Performed:**
+  * Rust Test Suite: 188 tests passing (182 existing + 6 M8 verification tests).
+  * Python Test Suite: 23 tests passing.
+  * Total Automated Tests: 211 passed across the workspace (100% pass rate).
+  * Benchmark Suite: 3 runs completed with 0 errors, outputting `docs/benchmarks/m8_baseline.json`.
+  * Linter / Clippy: Clean run with `cargo clippy --workspace --all-targets --all-features -- -D warnings` (0 warnings, 0 errors).
+  * Formatting & Style: Clean run with `rustfmt --check crates/aurora-ai/src/config.rs crates/aurora-ai/src/supervisor.rs crates/aurora-ai/tests/m8_audit_verification_tests.rs crates/aurora-ai/benches/m8_baselines.rs` and `git diff --check`.
+  * Workspace-Wide Formatting State: Preserved legacy formatting backlog from M1–M6b, with targeted checks passing for all new and modified M8 files.
+* **Relevant Documents & Code:**
+  * System Audit: [`docs/audit-m8.md`](audit-m8.md)
+  * Performance Baselines: [`docs/performance-baselines-m8.md`](performance-baselines-m8.md)
+  * Baseline Data: [`docs/benchmarks/m8_baseline.json`](benchmarks/m8_baseline.json)
+  * Decision Record: [`docs/decisions/0003-socketpair-ipc-transport.md`](decisions/0003-socketpair-ipc-transport.md)
+  * Configuration: `crates/aurora-ai/src/config.rs`
+  * Supervisor: `crates/aurora-ai/src/supervisor.rs`
+  * Audit Tests: `crates/aurora-ai/tests/m8_audit_verification_tests.rs`
+  * Benchmark Harness: `crates/aurora-ai/benches/m8_baselines.rs`

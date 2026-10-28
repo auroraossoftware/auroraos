@@ -46,6 +46,7 @@ pub enum SupervisorError {
     HandshakeRejected(String),
     UnexpectedMessage(String),
     SocketAlreadyExists(PathBuf),
+    TurnProposalLimitExceeded { count: usize, limit: usize },
 }
 
 impl std::fmt::Display for SupervisorError {
@@ -68,6 +69,12 @@ impl std::fmt::Display for SupervisorError {
             Self::UnexpectedMessage(msg) => write!(f, "unexpected message received: {msg}"),
             Self::SocketAlreadyExists(p) => {
                 write!(f, "socket path already exists: {}", p.display())
+            }
+            Self::TurnProposalLimitExceeded { count, limit } => {
+                write!(
+                    f,
+                    "turn capability proposal limit exceeded: received {count} proposals, maximum allowed is {limit}"
+                )
             }
         }
     }
@@ -207,6 +214,11 @@ impl WorkerSupervisor {
     /// Returns the worker version reported during handshake, if established.
     pub fn worker_version(&self) -> Option<&str> {
         self.worker_version.as_deref()
+    }
+
+    /// Returns the process ID of the supervised worker child process, if running.
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
     }
 
     /// Returns whether this supervisor instance owns the socket at `socket_path`.
@@ -472,6 +484,8 @@ impl WorkerSupervisor {
             return Err(SupervisorError::Ipc(e));
         }
 
+        let mut turn_proposals_count: usize = 0;
+
         loop {
             let res = {
                 let reader = self
@@ -497,6 +511,17 @@ impl WorkerSupervisor {
 
             match msg {
                 WorkerToDaemonMessage::ProposeCapability(proposal) => {
+                    // Count every proposal immediately upon receipt before validation, policy checks, or dispatch
+                    turn_proposals_count += 1;
+                    if turn_proposals_count > self.config.max_proposals_per_turn {
+                        self.reader = None;
+                        self.writer = None;
+                        return Err(SupervisorError::TurnProposalLimitExceeded {
+                            count: turn_proposals_count,
+                            limit: self.config.max_proposals_per_turn,
+                        });
+                    }
+
                     if proposal.turn_id != turn_id {
                         self.reader = None;
                         self.writer = None;

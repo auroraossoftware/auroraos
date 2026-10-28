@@ -8,3 +8,7 @@ description = "Central system AI daemon for Aurora OS (lifecycle & supervision)"
 aurora-protocol = { path = "../aurora-protocol" }
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 serde_json = "1.0"
+
+[[bench]]
+name = "m8_baselines"
+harness = false
