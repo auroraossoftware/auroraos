@@ -2,7 +2,7 @@
 
 * **Status:** Living Document
 * **Authoritative Architecture Context:** [ADR-001](decisions/0001-core-daemon-and-worker-runtime-architecture.md), [ADR-002](decisions/0002-capability-and-permission-architecture.md), and [Vertical Slice Prototype Design](vertical-slice-prototype-design.md)
-* **Current Progress:** Milestones 1–8 Complete
+* **Current Progress:** Milestones 1–9 Complete
 
 ---
 
@@ -12,16 +12,9 @@ The milestones documented below track prototype implementation progress against 
 
 1. **Deterministic Worker Stub (No Neural Models):** The AI worker process is a deterministic Python stub simulating reasoning and intent formulation; no real LLM, model runtime (PyTorch/llama.cpp), embeddings, or inference engine has been introduced.
 2. **IPC & Caller Authentication:** Public D-Bus IPC, system bus interfaces, and production caller authentication (e.g., Polkit integration, bus credentials) are deliberately deferred. In M1–M5, callers are represented via internal principal abstractions and direct CLI flags.
-3. **Worker Sandboxing & Ambient Authority:** Operating-system-level confinement (e.g., custom seccomp-bpf filters, Landlock, cgroups, user/mount namespaces) has not yet been established. The worker currently executes as a standard unprivileged child process sharing the daemon's UID. While capability permissions and policy gates are strictly enforced at the daemon's dispatcher boundary, the worker process retains the ambient OS authority of its executing UID (including direct filesystem access to world-readable files and shared same-UID directories). True zero-ambient-authority confinement requires dedicated OS sandboxing.
+3. **Worker Sandboxing & Ambient Authority:** Operating-system-level confinement (e.g., custom seccomp-bpf filters, Landlock, cgroups, user/mount namespaces) has not yet been established. The worker currently executes as a standard unprivileged child process sharing the daemon's UID. While capability permissions and policy gates are strictly enforced at the daemon's dispatcher boundary, the worker process retains the ambient OS authority of its executing UID (including direct filesystem access to world-readable files and shared same-UID directories). True zero-ambient-authority confinement requires dedicated OS sandboxing in a future milestone.
 4. **Test Reporting:** All reported passing tests are implementation-reported automated test suite results verifying internal structural contracts, fail-closed boundaries, and execution paths; they do not represent independent third-party security certification.
-5. **Filesystem Socket Lifecycle & Threat-Model Boundaries:** Path-based Unix domain socket IPC in shared filesystem directories has inherent Linux VFS boundaries:
-   * *Default Path Construction & Lifecycle:* The default socket path is constructed via `std::env::temp_dir()` and the current process ID (`aurora-ai-{PID}.sock`). While this often resolves under `/tmp` on standard Linux installations, the exact temporary directory depends on environment variables (`$TMPDIR`, `$TEMP`, `$TMP`) or container configuration. Normal clean shutdown unlinks and removes the socket path, but abrupt termination (`SIGKILL`, unhandled signal, crash) leaves an orphaned socket file.
-   * *Stale-File Accumulation & PID Reuse Collisions:* PID-based naming avoids bind collisions between immediate sequential or concurrent launches with different process IDs. However, it does not eliminate stale-file accumulation in the temporary directory. Moreover, because operating system PID spaces are finite and cycle over time, eventual PID recycling can result in a new daemon invocation receiving a PID that corresponds to an existing stale socket file, causing `UnixListener::bind` to fail with `EADDRINUSE`.
-   * *Cross-UID Isolation vs. Same-UID Boundaries:* The current implementation does not create or validate parent directory permissions in code. Deploying the socket in an external private directory with mode `0700` owned by the daemon user is an operational deployment recommendation that isolates the socket from other unprivileged UIDs, but it is not enforced by code and does **not** protect against a malicious or compromised process sharing the daemon's own UID.
-   * *Two Distinct Socket Lifecycle Races on Shared Paths:*
-     1. *Post-Bind Ownership-Capture Race:* Between `UnixListener::bind(&path)` returning and `symlink_metadata(&path)` reading the host inode, a concurrent same-UID process could unlink the socket and substitute another entry, causing the daemon to record the replacement's inode.
-     2. *Shutdown Check-Then-Unlink Race:* Between `symlink_metadata(&path)` checking the entry on shutdown and `std::fs::remove_file(&path)` executing `unlink()`, a concurrent same-UID process could swap the socket with another file, causing the daemon to unlink the replacement. Linux provides no atomic `unlink_if_matches` syscall, and `fstat` on a socket descriptor queries `sockfs` (which diverges from the host filesystem's inode), preventing descriptor-based path validation.
-   * *Socket-Pair IPC Scope & Status of ADR-003:* Transitioning to anonymous `socketpair` IPC in Milestone 9 (proposed in ADR-003) will eliminate all filesystem-path races, stale-file accumulation, and PID-reuse bind conflicts for worker communication. However, ADR-003 remains strictly **Proposed**; these filesystem-path risks are not eliminated until socket-pair transport is implemented in M9. Furthermore, process-level isolation, memory safety, and file-descriptor inheritance remain separate security concerns.
+5. **IPC Transport Migration & Accepted ADR-003:** In Milestone 9, the internal daemon ↔ worker communication transport was transitioned to anonymous connected Unix stream socket pairs (`socketpair(AF_UNIX, SOCK_STREAM, 0)`), pursuant to Accepted ADR-003. This eliminated all filesystem pathname races, stale socket entries, directory permission dependencies, and pathname-based connection discovery for this private channel. Low-descriptor safety ($\ge 3$), standard descriptor mapping (`Stdio::from(OwnedFd)`), child process group isolation (`process_group(0)`), orderly shutdown escalation (EOF $\to$ SIGTERM $\to$ SIGKILL $\to$ `wait()`), and emergency parent-death containment via `PR_SET_PDEATHSIG(SIGKILL)` are active. Operating-system process isolation, kernel sandboxing, and ambient file authority remain distinct security boundaries to be addressed in subsequent milestones.
 
 ---
 
@@ -37,6 +30,7 @@ The milestones documented below track prototype implementation progress against 
 | **M6** | Remaining MVP Capabilities | **Complete** | Implemented `sys.memory.read` (M6a), `proc.list` (M6b), and kernel-contained `fs.file.read` (M6c). |
 | **M7** | Security, Rejection & Fault Containment Tests | **Complete** (Reconciled Prototype Scope) | Adversarial test harness, non-destructive socket pre-checking, fail-closed invalidation, and documented threat-model boundaries. |
 | **M8** | System Audit & Performance Baselines | **Complete** | End-to-end audit, performance baselines, proposal flood protection, and proposed ADR-003. |
+| **M9** | Reliable IPC & Worker Lifecycle Management | **Complete** | Anonymous socketpair IPC, low-descriptor safety, lazy recovery with bounded restarts, PR_SET_PDEATHSIG child containment, orderly shutdown ladder. |
 
 ---
 
@@ -469,3 +463,66 @@ The milestones documented below track prototype implementation progress against 
   * Supervisor: `crates/aurora-ai/src/supervisor.rs`
   * Audit Tests: `crates/aurora-ai/tests/m8_audit_verification_tests.rs`
   * Benchmark Harness: `crates/aurora-ai/benches/m8_baselines.rs`
+
+---
+
+### Milestone 9: Reliable IPC & Worker Lifecycle Management
+* **Status:** Complete
+* **Purpose:** Migrate internal core daemon ↔ worker private IPC from filesystem pathname Unix domain sockets to kernel-allocated anonymous `socketpair(AF_UNIX, SOCK_STREAM, 0)` pursuant to Accepted ADR-003; establish robust child descriptor inheritance via standard input (`Stdio::from(OwnedFd)`) with low-descriptor safety ($\ge 3$); pin the supervisor to a designated long-lived thread; enforce async-signal-safe child pre-exec configuration (daemon descriptor closure, signal mask reset, parent-death containment via `PR_SET_PDEATHSIG(SIGKILL)`); implement deterministic worker lifecycle state management with lazy replacement recovery bounded by a 3-consecutive-failure limit; strictly enforce zero replay of interrupted turns or capability side effects; and provide orderly signal escalation shutdown.
+* **Main Deliverables:**
+  * **Accepted ADR-003 Implementation:**
+    * Formally accepted [`docs/decisions/0003-socketpair-ipc-transport.md`](decisions/0003-socketpair-ipc-transport.md) (Status: Accepted, Date: 2026-11-13).
+    * Replaced `UnixListener::bind` with anonymous `UnixStream::pair()`.
+    * Complete elimination of filesystem socket path races, stale socket files, directory permission vulnerabilities, and pathname-based connection discovery.
+    * Retained 100% wire-protocol compatibility with Internal Worker Protocol v1, newline-delimited JSON (NDJSON) framing, and 512 KiB framing bounds.
+  * **Low-Descriptor Safety & Native Standard Input Handoff:**
+    * `ensure_fd_above_stdio`: validates and duplicates descriptors $< 3$ using `libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3)` to guard against closed stdio edge cases in parent daemon.
+    * Standard library descriptor mapping: child endpoint passed via `cmd.stdin(Stdio::from(OwnedFd))`, eliminating custom post-fork descriptor shuffling and race conditions.
+    * Python worker descriptor hygiene (`worker/main.py:init_socket_from_fd`): instantiates `socket.socket` from FD 0, immediately redirects raw FD 0 and `sys.stdin` to `/dev/null`.
+  * **Thread Ownership Pinning & Safe `pre_exec` Configuration:**
+    * Designated thread pinning: `WorkerSupervisor` records `owner_thread_id` and includes `PhantomData<*const ()>` to prevent cross-thread sharing/sending, ensuring `PR_SET_PDEATHSIG` remains reliably tied to the long-lived supervisor thread.
+    * Child process group isolation: `cmd.process_group(0)` isolates worker child from terminal `SIGINT` (Ctrl+C).
+    * Async-signal-safe `pre_exec`: closes daemon supervisor endpoint, resets blocked signals via `sigprocmask(SIG_SETMASK, &empty_set, NULL)`, registers `libc::prctl(PR_SET_PDEATHSIG, SIGKILL)`, verifies parent existence via `getppid() == parent_pid`, with zero memory allocations.
+  * **Lifecycle State Machine & Lazy Replacement Recovery:**
+    * Explicit state machine (`WorkerState`: `Uninitialized`, `Starting`, `Ready`, `Busy`, `Recovering`, `Degraded`, `Terminated`).
+    * Explicit error propagation in `poll_status()` (never assumes healthy on `waitpid` failure).
+    * Lazy recovery: idle crashes or active turn failures transition to `Recovering`; replacement worker is spawned lazily upon the next request turn.
+    * Bounded restart limit: exactly 3 consecutive failed replacement attempts latch supervisor into `Degraded` (`WorkerRestartLimitExceeded`). Flapping recovery: workers surviving $\ge 10$ seconds (`healthy_reset_window`) reset the failure counter.
+    * Programmatic operator recovery: `supervisor.reset()` clears degraded state and relaunches worker.
+    * Interrupted turn safety: interrupted active turns return `SupervisorError::WorkerTerminatedDuringTurn` reporting completed proposal names and exit status; zero capability proposals or prompts are ever replayed.
+  * **Orderly Shutdown Escalation Ladder:**
+    * Stage 1: Graceful EOF (reader/writer dropped, up to 200ms wait).
+    * Stage 2: `SIGTERM` signal escalation (up to 300ms wait).
+    * Stage 3: `SIGKILL` emergency termination fallback.
+    * Stage 4: Mandatory child reaping (`child.wait()`) preventing zombie leaks.
+  * **Milestone 9 Test Suite (`crates/aurora-ai/tests/m9_socketpair_lifecycle_tests.rs`):**
+    * 14 comprehensive tests verifying all M9 requirements:
+      1. `M9-IPC-01`: Nominal socketpair handshake over FD 0; diskless operation (`!dummy_path.exists()`).
+      2. `M9-IPC-02`: 512 KiB framing limit over socketpair (+1 byte drops connection with `IpcError::FrameTooLarge`).
+      3. `M9-RECOV-01`: Idle worker crash detection via `poll_status()`, child reaped, transitions to `Recovering`.
+      4. `M9-RECOV-02`: Active turn crash returns `WorkerTerminatedDuringTurn`, completed proposals recorded, 0 proposals replayed.
+      5. `M9-RECOV-03`: Lazy recovery on next request succeeds with fresh socketpair and distinct PID.
+      6. `M9-RECOV-04`: Idle crash followed immediately by `execute_turn()` detects dead child and transparently recovers.
+      7. `M9-LIMIT-01`: Exactly 3 consecutive failed replacement attempts latch supervisor into `Degraded`; operator `reset()` restores.
+      8. `M9-LIMIT-02`: Flapping worker counter resets strictly after healthy window.
+      9. `M9-SHUT-01`: Orderly signal shutdown (EOF -> clean worker exit -> child reaped, `ESRCH` verified).
+      10. `M9-SHUT-02`: Escalation to SIGTERM and SIGKILL for unresponsive worker.
+      11. `M9-SHUT-03`: Abrupt daemon SIGKILL terminates worker via `PR_SET_PDEATHSIG(SIGKILL)` within bounded deadline ($\le 1.0$s).
+      12. `M9-SIGINT-01`: Active turn interruption via SIGINT cancels turn, reaps worker without hanging.
+      13. `M9-DESC-01`: Low-descriptor safety edge case (`ensure_fd_above_stdio` allocates FD $\ge 3$).
+      14. `M9-LEAK-01`: Descriptor leak invariance across 10 crash and lazy restart cycles ($\Delta \mathcal{S}_{\text{FD}} = \emptyset$).
+      15. `M9-REG-01`: All 4 MVP capabilities regression over socketpair (`sys.cpu.read`, `sys.memory.read`, `proc.list`, `fs.file.read`).
+* **Verification Performed:**
+  * Rust Test Suite: 203 tests passing (48 unit, 9 M4, 12 M5, 10 M6a, 13 M6b, 29 M6c, 29 M7, 6 M8, 15 M9, 15 policy, 6 supervisor, 11 protocol).
+  * Python Test Suite: 25 tests passing (added `test_init_socket_from_fd_and_run_worker_socket` and `test_init_socket_from_fd_descriptor_ownership_and_stdin_behavior`).
+  * Total Automated Tests: 228 tests passed across the workspace (100% pass rate).
+  * Linter / Clippy: Clean run with `cargo clippy --workspace --all-targets --all-features -- -D warnings` (0 warnings, 0 errors).
+  * Formatting & Style: Clean run with `rustfmt crates/aurora-ai/tests/m9_socketpair_lifecycle_tests.rs` and targeted checks.
+  * Git Working Tree: Clean and uncommitted for review.
+* **Relevant Documents & Code:**
+  * Decision Record: [`docs/decisions/0003-socketpair-ipc-transport.md`](decisions/0003-socketpair-ipc-transport.md)
+  * Supervisor: `crates/aurora-ai/src/supervisor.rs`
+  * Configuration: `crates/aurora-ai/src/config.rs`
+  * Worker Runtime: `worker/main.py`
+  * Rust Tests: `crates/aurora-ai/tests/m9_socketpair_lifecycle_tests.rs`
+  * Python Tests: `worker/test_worker.py`

@@ -30,4 +30,4 @@ pub use provider::{
     MemoryProvider, MockCpuProvider, MockFileProvider, MockMemoryProvider, MockProcessProvider,
     ProcessProvider, SandboxedLocalFileProvider, MAX_FILE_SIZE_BYTES,
 };
-pub use supervisor::{SupervisorError, WorkerStatus, WorkerSupervisor};
+pub use supervisor::{SupervisorError, WorkerState, WorkerStatus, WorkerSupervisor};

@@ -6,7 +6,7 @@ use std::time::Duration;
 /// Configuration options for the worker supervisor.
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
-    /// Filesystem path to the private Unix domain socket.
+    /// Filesystem path to the private Unix domain socket (retained for backward compatibility).
     pub socket_path: PathBuf,
     /// Command and arguments used to spawn the worker process.
     pub worker_command: Vec<String>,
@@ -20,6 +20,14 @@ pub struct SupervisorConfig {
     pub socket_timeout: Duration,
     /// Maximum number of capability proposals permitted in a single turn (defaults to 20).
     pub max_proposals_per_turn: usize,
+    /// Maximum number of consecutive failed replacement attempts before transitioning to Degraded (defaults to 3).
+    pub max_consecutive_restarts: usize,
+    /// Base duration for exponential backoff between replacement restart attempts (defaults to 50ms).
+    pub restart_backoff_base: Duration,
+    /// Minimum continuous healthy duration (in Ready or Busy) required to reset the restart counter (defaults to 10s).
+    pub healthy_reset_window: Duration,
+    /// Whether to enable Linux signalfd-based signal handling for SIGINT and SIGTERM (defaults to true).
+    pub enable_signal_handling: bool,
 }
 
 impl Default for SupervisorConfig {
@@ -39,6 +47,10 @@ impl Default for SupervisorConfig {
             handshake_timeout: Duration::from_secs(5),
             socket_timeout: Duration::from_secs(5),
             max_proposals_per_turn: 20,
+            max_consecutive_restarts: 3,
+            restart_backoff_base: Duration::from_millis(50),
+            healthy_reset_window: Duration::from_secs(10),
+            enable_signal_handling: true,
         }
     }
 }
@@ -83,6 +95,30 @@ impl SupervisorConfig {
     /// Sets maximum number of capability proposals permitted in a single turn.
     pub fn with_max_proposals_per_turn(mut self, max: usize) -> Self {
         self.max_proposals_per_turn = max;
+        self
+    }
+
+    /// Sets maximum number of consecutive replacement restart attempts.
+    pub fn with_max_consecutive_restarts(mut self, max: usize) -> Self {
+        self.max_consecutive_restarts = max;
+        self
+    }
+
+    /// Sets base backoff duration between restart attempts.
+    pub fn with_restart_backoff_base(mut self, duration: Duration) -> Self {
+        self.restart_backoff_base = duration;
+        self
+    }
+
+    /// Sets continuous healthy duration required to reset the restart counter.
+    pub fn with_healthy_reset_window(mut self, duration: Duration) -> Self {
+        self.healthy_reset_window = duration;
+        self
+    }
+
+    /// Sets whether signalfd-based signal handling is enabled.
+    pub fn with_signal_handling(mut self, enabled: bool) -> Self {
+        self.enable_signal_handling = enabled;
         self
     }
 }

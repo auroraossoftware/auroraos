@@ -11,11 +11,24 @@
 //!    -> policy -> provider -> outcome -> worker synthesis -> complete turn -> caller).
 //! 5. Monitors worker health and shuts down cleanly without resource leaks.
 
-use aurora_ai::{CallerIdentity, SupervisorConfig, WorkerStatus, WorkerSupervisor};
+use aurora_ai::{
+    CallerIdentity, SupervisorConfig, SupervisorError, WorkerStatus, WorkerSupervisor,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Single-threaded daemon supervision model:
+    // Block SIGINT and SIGTERM immediately on the initial thread before any operations
+    // or potential runtime worker threads are created, ensuring the blocked mask is inherited.
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+    }
+
     let args: Vec<String> = std::env::args().collect();
     println!("Starting aurora-ai core daemon (M5 vertical slice)...");
 
@@ -70,7 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Options:");
                 println!("  --request <PROMPT>       Execute an end-to-end request turn and print output");
                 println!("  --caller <NAME>          Set caller principal identity (default: 'desktop-user')");
-                println!("  --unauthorized           Simulate ungranted caller (policy denial test)");
+                println!(
+                    "  --unauthorized           Simulate ungranted caller (policy denial test)"
+                );
                 println!("  --anonymous              Simulate unauthenticated anonymous caller");
                 println!("  --socket-path <PATH>     Custom private Unix domain socket path");
                 println!("  --test-handshake-only    Perform startup handshake and exit");
@@ -115,6 +130,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Worker connected and verified. Protocol version compatible, reported worker version: {:?}",
         supervisor.worker_version().unwrap_or("unknown")
     );
+    if let Some(pid) = supervisor.worker_pid() {
+        println!("Worker child PID: {pid}");
+    }
 
     if test_handshake_only {
         println!("Handshake verified successfully. Shutting down cleanly...");
@@ -159,16 +177,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        match supervisor.poll_status()? {
-            WorkerStatus::Running => {
+        match supervisor.poll_status() {
+            Ok(WorkerStatus::Running) => {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            WorkerStatus::Terminated(exit_code) => {
-                println!("Worker terminated with exit code: {exit_code:?}. Daemon shutting down safely.");
+            Ok(WorkerStatus::Terminated(exit_code)) => {
+                println!(
+                    "Worker terminated with exit code: {exit_code:?}. Daemon shutting down safely."
+                );
                 break;
             }
-            WorkerStatus::Disconnected => {
+            Ok(WorkerStatus::Disconnected) => {
                 println!("Worker disconnected from IPC socket. Daemon shutting down safely.");
+                break;
+            }
+            Ok(WorkerStatus::Degraded) => {
+                eprintln!("Worker supervisor degraded due to repeated restart failures. Daemon shutting down.");
+                break;
+            }
+            Err(SupervisorError::Interrupted) => {
+                println!("Daemon received interrupt signal. Shutting down safely.");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Health check error: {e}");
                 break;
             }
         }

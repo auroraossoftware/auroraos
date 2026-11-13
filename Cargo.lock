@@ -7,6 +7,7 @@ name = "aurora-ai"
 version = "0.1.0"
 dependencies = [
  "aurora-protocol",
+ "libc",
  "rustix",
  "serde_json",
 ]

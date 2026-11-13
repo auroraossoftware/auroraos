@@ -3,12 +3,13 @@
 import json
 import os
 import socket
+import sys
 import tempfile
 import threading
 import time
 import unittest
 
-from worker.main import run_worker
+from worker.main import init_socket_from_fd, run_worker, run_worker_socket
 from worker.protocol import CURRENT_PROTOCOL_VERSION
 
 
@@ -832,6 +833,88 @@ class TestWorkerLifecycle(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         daemon_thread.join()
         server.close()
+
+    def test_init_socket_from_fd_and_run_worker_socket(self):
+        from worker.main import init_socket_from_fd, run_worker_socket
+        import sys
+
+        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        def mock_daemon():
+            conn_file = s1.makefile("rw", buffering=1, encoding="utf-8")
+            conn_file.write(
+                json.dumps({
+                    "type": "handshake",
+                    "protocol_version": CURRENT_PROTOCOL_VERSION,
+                    "daemon_version": "0.1.0",
+                })
+                + "\n"
+            )
+            conn_file.flush()
+
+            resp_line = conn_file.readline()
+            resp = json.loads(resp_line.strip())
+            self.assertEqual(resp.get("type"), "handshake_response")
+            self.assertEqual(resp.get("status"), "ready")
+
+            conn_file.close()
+            s1.close()
+
+        daemon_thread = threading.Thread(target=mock_daemon)
+        daemon_thread.start()
+
+        target_fd = os.dup(s2.fileno())
+        s2.close()
+
+        sock = init_socket_from_fd(target_fd)
+        self.assertEqual(sys.stdin.read(), "")
+
+        exit_code = run_worker_socket(sock)
+        self.assertEqual(exit_code, 0)
+        daemon_thread.join()
+
+    def test_init_socket_from_fd_descriptor_ownership_and_stdin_behavior(self):
+        """Verifies descriptor ownership, /dev/null redirection, and stdin closefd safety."""
+        import gc
+
+        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        saved_stdin_fd = os.dup(0)
+        test_raw_fd = os.dup(s2.fileno())
+        os.dup2(test_raw_fd, 0)
+        os.close(test_raw_fd)
+        s2.close()
+
+        try:
+            # Initialize socket from FD 0
+            sock = init_socket_from_fd(0)
+
+            # 1. Duplicated socket is independent and functional
+            s1.sendall(b"test_payload\n")
+            received = sock.recv(1024)
+            self.assertEqual(received, b"test_payload\n")
+            self.assertNotEqual(sock.fileno(), 0)
+
+            # 2. FD 0 is redirected to /dev/null
+            self.assertEqual(sys.stdin.fileno(), 0)
+            self.assertEqual(sys.stdin.read(), "")
+
+            # 3. Triggering garbage collection does not close FD 0
+            gc.collect()
+            st = os.fstat(0)
+            self.assertIsNotNone(st)
+
+            # 4. Explicit sys.stdin.close() does not close underlying FD 0 (closefd=False)
+            sys.stdin.close()
+            st_after = os.fstat(0)
+            self.assertEqual(st.st_ino, st_after.st_ino)
+
+            sock.close()
+            s1.close()
+        finally:
+            # Restore saved stdin descriptor
+            os.dup2(saved_stdin_fd, 0)
+            os.close(saved_stdin_fd)
+            sys.stdin = open(0, "r", closefd=False)
 
 
 if __name__ == "__main__":

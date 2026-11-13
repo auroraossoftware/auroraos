@@ -6,6 +6,7 @@ description = "Central system AI daemon for Aurora OS (lifecycle & supervision)"
 
 [dependencies]
 aurora-protocol = { path = "../aurora-protocol" }
+libc = "0.2"
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 serde_json = "1.0"
 

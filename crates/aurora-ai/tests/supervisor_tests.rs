@@ -13,7 +13,10 @@ fn get_workspace_root() -> PathBuf {
 }
 
 fn create_test_config(test_name: &str) -> SupervisorConfig {
-    let temp_socket = std::env::temp_dir().join(format!("aurora-test-{test_name}-{}.sock", std::process::id()));
+    let temp_socket = std::env::temp_dir().join(format!(
+        "aurora-test-{test_name}-{}.sock",
+        std::process::id()
+    ));
     SupervisorConfig::default()
         .with_socket_path(temp_socket)
         .with_handshake_timeout(Duration::from_secs(5))
@@ -23,7 +26,11 @@ fn create_test_config(test_name: &str) -> SupervisorConfig {
 fn test_daemon_starts_and_initializes_state() {
     let config = create_test_config("init");
     let supervisor = WorkerSupervisor::new(config);
-    assert!(supervisor.socket_path().to_str().unwrap().contains("aurora-test-init"));
+    assert!(supervisor
+        .socket_path()
+        .to_str()
+        .unwrap()
+        .contains("aurora-test-init"));
     assert_eq!(supervisor.worker_version(), None);
 }
 
@@ -38,7 +45,11 @@ fn test_worker_spawn_connection_and_handshake_success() {
 
     // 1. Daemon starts, worker starts, connection established, handshake succeeds
     let start_result = supervisor.start();
-    assert!(start_result.is_ok(), "Supervisor failed to start: {:?}", start_result.err());
+    assert!(
+        start_result.is_ok(),
+        "Supervisor failed to start: {:?}",
+        start_result.err()
+    );
 
     // 2. Protocol version compatibility confirmed
     assert_eq!(supervisor.worker_version(), Some("0.1.0"));
@@ -47,12 +58,15 @@ fn test_worker_spawn_connection_and_handshake_success() {
     let status = supervisor.poll_status().expect("poll_status failed");
     assert_eq!(status, WorkerStatus::Running);
 
-    // 4. Socket file exists while running
-    assert!(socket_path.exists(), "Socket file should exist while supervisor is running");
+    // 4. Socketpair operates in kernel memory without creating filesystem entries
+    assert!(
+        !socket_path.exists(),
+        "Socketpair does not create files on disk"
+    );
 
-    // 5. Clean shutdown cleans up IPC resources
+    // 5. Clean shutdown reaps worker without resource leaks
     supervisor.shutdown();
-    assert!(!socket_path.exists(), "Socket file must be removed after clean shutdown");
+    assert!(!socket_path.exists(), "No socket file created on disk");
 }
 
 #[test]
@@ -72,7 +86,10 @@ fn test_reject_incompatible_protocol_version() {
 
     // Supervisor should fail handshake due to version mismatch
     let result = supervisor.start();
-    assert!(result.is_err(), "Expected start to fail due to incompatible version");
+    assert!(
+        result.is_err(),
+        "Expected start to fail due to incompatible version"
+    );
 
     match result {
         Err(SupervisorError::HandshakeRejected(reason)) => {
@@ -84,7 +101,10 @@ fn test_reject_incompatible_protocol_version() {
 
     // Ensure daemon does not crash and socket is cleaned up
     supervisor.shutdown();
-    assert!(!socket_path.exists(), "Socket file must be removed after failed start");
+    assert!(
+        !socket_path.exists(),
+        "Socket file must be removed after failed start"
+    );
 }
 
 #[test]
@@ -103,9 +123,14 @@ fn test_worker_termination_detected_without_crash() {
     supervisor.shutdown();
 
     // Verify polling terminated worker does not panic or crash daemon
-    let status = supervisor.poll_status().expect("poll_status should not error on terminated worker");
+    let status = supervisor
+        .poll_status()
+        .expect("poll_status should not error on terminated worker");
     assert_eq!(status, WorkerStatus::Terminated(None));
-    assert!(!socket_path.exists(), "Socket must be removed after shutdown");
+    assert!(
+        !socket_path.exists(),
+        "Socket must be removed after shutdown"
+    );
 }
 
 #[test]
@@ -118,13 +143,20 @@ fn test_clean_shutdown_removes_socket_and_reaps_worker() {
     let socket_path = supervisor.socket_path().to_path_buf();
 
     supervisor.start().expect("Supervisor start failed");
-    assert!(socket_path.exists());
+    // Under socketpair, no socket file exists on disk
+    assert!(
+        !socket_path.exists(),
+        "Socketpair does not create files on disk"
+    );
 
     // Normal shutdown
     supervisor.shutdown();
 
-    // Socket unlinked
-    assert!(!socket_path.exists(), "Socket path should not exist after shutdown");
+    // Socket still does not exist on disk
+    assert!(
+        !socket_path.exists(),
+        "Socket path should not exist after shutdown"
+    );
 
     // Re-calling shutdown is idempotent
     supervisor.shutdown();

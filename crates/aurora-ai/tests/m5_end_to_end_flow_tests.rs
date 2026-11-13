@@ -23,12 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aurora_ai::{
-    CapabilityDispatcher, CapabilityExecutionError, CallerIdentity, MockCpuProvider,
-    PolicyEngine, SupervisorConfig, SupervisorError, WorkerStatus, WorkerSupervisor,
+    CallerIdentity, CapabilityDispatcher, CapabilityExecutionError, MockCpuProvider, PolicyEngine,
+    SupervisorConfig, SupervisorError, WorkerStatus, WorkerSupervisor,
 };
-use aurora_protocol::{
-    CURRENT_PROTOCOL_VERSION, TurnStatus,
-};
+use aurora_protocol::{TurnStatus, CURRENT_PROTOCOL_VERSION};
 
 fn get_workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -40,10 +38,8 @@ fn get_workspace_root() -> PathBuf {
 }
 
 fn create_test_config(test_name: &str) -> SupervisorConfig {
-    let temp_socket = std::env::temp_dir().join(format!(
-        "aurora-m5-{test_name}-{}.sock",
-        std::process::id()
-    ));
+    let temp_socket =
+        std::env::temp_dir().join(format!("aurora-m5-{test_name}-{}.sock", std::process::id()));
     let mut config = SupervisorConfig::default()
         .with_socket_path(temp_socket)
         .with_handshake_timeout(Duration::from_secs(5));
@@ -265,7 +261,9 @@ fn test_unknown_capability_rejected_before_provider_execution() {
 
     assert_eq!(mock_provider.invocation_count(), 0);
     assert_eq!(complete_turn.status, TurnStatus::Error);
-    assert!(complete_turn.response_text.contains("Unknown or unregistered"));
+    assert!(complete_turn
+        .response_text
+        .contains("Unknown or unregistered"));
 
     supervisor.shutdown();
 }
@@ -289,9 +287,12 @@ fn test_worker_crash_during_request_handled_without_daemon_crash() {
     let result = supervisor.execute_turn(&caller, "simulate_crash");
 
     // Daemon must not panic or crash; returns IPC error
-    assert!(result.is_err(), "Expected turn execution to fail on worker crash");
+    assert!(
+        result.is_err(),
+        "Expected turn execution to fail on worker crash"
+    );
     match result {
-        Err(SupervisorError::Ipc(_)) => {}
+        Err(SupervisorError::Ipc(_)) | Err(SupervisorError::WorkerTerminatedDuringTurn { .. }) => {}
         Err(other) => panic!("Expected IPC error on crash, got: {other:?}"),
         Ok(_) => panic!("Turn unexpectedly succeeded on crashed worker"),
     }
@@ -300,14 +301,20 @@ fn test_worker_crash_during_request_handled_without_daemon_crash() {
     // Allow OS scheduler a moment to reap child process
     let mut status = supervisor.poll_status().expect("poll_status failed");
     for _ in 0..20 {
-        if matches!(status, WorkerStatus::Terminated(_) | WorkerStatus::Disconnected) {
+        if matches!(
+            status,
+            WorkerStatus::Terminated(_) | WorkerStatus::Disconnected
+        ) {
             break;
         }
         std::thread::sleep(Duration::from_millis(25));
         status = supervisor.poll_status().expect("poll_status failed");
     }
     assert!(
-        matches!(status, WorkerStatus::Terminated(_) | WorkerStatus::Disconnected),
+        matches!(
+            status,
+            WorkerStatus::Terminated(_) | WorkerStatus::Disconnected
+        ),
         "Expected Terminated or Disconnected status, got {status:?}"
     );
 
@@ -326,10 +333,9 @@ fn test_capability_provider_failure_propagates_as_execution_error_not_permission
     policy.grant(caller.clone(), "sys.cpu.read");
 
     // Provider is authorized, but simulates a host hardware/kernel read failure
-    let mock_provider = Arc::new(MockCpuProvider::with_failure(CapabilityExecutionError::new(
-        "IO_ERROR",
-        "Failed to read /proc/stat: input/output error",
-    )));
+    let mock_provider = Arc::new(MockCpuProvider::with_failure(
+        CapabilityExecutionError::new("IO_ERROR", "Failed to read /proc/stat: input/output error"),
+    ));
 
     let dispatcher = CapabilityDispatcher::new(policy, mock_provider.clone());
     let mut supervisor = WorkerSupervisor::with_dispatcher(config, dispatcher);
@@ -363,7 +369,8 @@ fn test_capability_provider_failure_propagates_as_execution_error_not_permission
 /// Test 6: Protocol validation: malformed or incompatible messages cannot bypass policy/execution boundary.
 #[test]
 fn test_malformed_worker_message_cannot_trigger_capability_execution() {
-    let (mut client_stream, server_stream) = UnixStream::pair().expect("Failed to create socket pair");
+    let (mut client_stream, server_stream) =
+        UnixStream::pair().expect("Failed to create socket pair");
     client_stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -376,8 +383,8 @@ fn test_malformed_worker_message_cannot_trigger_capability_execution() {
     let dispatcher = CapabilityDispatcher::new(policy, mock_provider.clone());
 
     let config = create_test_config("malformed_wire");
-    let mut supervisor =
-        WorkerSupervisor::from_stream(config, dispatcher, server_stream).expect("from_stream failed");
+    let mut supervisor = WorkerSupervisor::from_stream(config, dispatcher, server_stream)
+        .expect("from_stream failed");
 
     // Spawn a mock worker thread that sends raw malformed JSON
     std::thread::spawn(move || {
@@ -387,14 +394,19 @@ fn test_malformed_worker_message_cannot_trigger_capability_execution() {
         std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
 
         // Respond with completely malformed JSON
-        client_stream.write_all(b"{ malformed syntax ::: not json }\n").unwrap();
+        client_stream
+            .write_all(b"{ malformed syntax ::: not json }\n")
+            .unwrap();
         client_stream.flush().unwrap();
     });
 
     let result = supervisor.execute_turn(&caller, "test prompt");
 
     // Daemon parser rejects malformed JSON
-    assert!(result.is_err(), "Expected deserialization error on malformed message");
+    assert!(
+        result.is_err(),
+        "Expected deserialization error on malformed message"
+    );
     match result {
         Err(SupervisorError::Ipc(aurora_ai::ipc::IpcError::Serialization(_))) => {}
         Err(other) => panic!("Expected Serialization error, got: {other:?}"),
@@ -408,7 +420,8 @@ fn test_malformed_worker_message_cannot_trigger_capability_execution() {
 /// Test 6b: Forged message direction (worker sending DaemonToWorker message) rejected and provider not executed.
 #[test]
 fn test_forged_daemon_message_from_worker_rejected() {
-    let (mut client_stream, server_stream) = UnixStream::pair().expect("Failed to create socket pair");
+    let (mut client_stream, server_stream) =
+        UnixStream::pair().expect("Failed to create socket pair");
     let caller = CallerIdentity::principal("desktop-user");
     let mut policy = PolicyEngine::new_mvp(PathBuf::from("/tmp/sandbox"));
     policy.grant(caller.clone(), "sys.cpu.read");
@@ -417,8 +430,8 @@ fn test_forged_daemon_message_from_worker_rejected() {
     let dispatcher = CapabilityDispatcher::new(policy, mock_provider.clone());
 
     let config = create_test_config("forged_msg");
-    let mut supervisor =
-        WorkerSupervisor::from_stream(config, dispatcher, server_stream).expect("from_stream failed");
+    let mut supervisor = WorkerSupervisor::from_stream(config, dispatcher, server_stream)
+        .expect("from_stream failed");
 
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(client_stream.try_clone().unwrap());
@@ -427,7 +440,9 @@ fn test_forged_daemon_message_from_worker_rejected() {
 
         // Worker attempts to forge a DaemonToWorker message: CapabilityResult
         let forged = r#"{"type": "capability_result", "protocol_version": 1, "turn_id": "turn-1", "call_id": "c1", "outcome": {"status": "success", "data": {}}}"#;
-        client_stream.write_all(format!("{forged}\n").as_bytes()).unwrap();
+        client_stream
+            .write_all(format!("{forged}\n").as_bytes())
+            .unwrap();
         client_stream.flush().unwrap();
     });
 

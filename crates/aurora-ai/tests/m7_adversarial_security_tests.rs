@@ -937,9 +937,7 @@ fn test_turn_socket_read_timeout_and_cleanup() {
         "-c".to_string(),
         r#"
 import socket, sys, time, json
-sock_path = sys.argv[2]
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(sock_path)
+s = socket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM)
 sf = s.makefile('rwb')
 l = sf.readline()
 d = json.loads(l)
@@ -1269,10 +1267,10 @@ fn test_socket_path_replacement_safeguard() {
 
     let mut supervisor = WorkerSupervisor::new(config);
     supervisor.start().expect("Supervisor start failed");
-    assert!(supervisor.owns_socket());
+    // Under M9 socketpair, supervisor does not own or create filesystem socket entries
+    assert!(!supervisor.owns_socket());
 
-    // Replace the bound socket with a regular file
-    fs::remove_file(&socket_path).expect("remove bound socket failed");
+    // Attacker drops a replacement regular file at configured socket_path
     fs::write(&socket_path, "REPLACEMENT_DATA").expect("write replacement failed");
 
     // Shutdown supervisor

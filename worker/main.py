@@ -302,22 +302,41 @@ def handle_request_turn(sock_file, req_data: dict) -> None:
     sock_file.flush()
 
 
-def run_worker(
-    socket_path: str,
+def init_socket_from_fd(raw_fd: int = 0) -> socket.socket:
+    """Initializes IPC socket from inherited descriptor (default FD 0), safely redirecting FD 0 to /dev/null.
+
+    1. Duplicates the raw file descriptor into a managed Python socket before any redirection.
+    2. Safely closes the existing sys.stdin wrapper so it cannot close reused FDs upon garbage collection.
+    3. Atomically redirects raw_fd (FD 0) to /dev/null via dup2.
+    4. Replaces sys.stdin with a /dev/null reader on raw_fd with closefd=False to prevent accidental closure.
+    """
+    # Step 1: Duplicate socket handle
+    sock = socket.fromfd(raw_fd, socket.AF_UNIX, socket.SOCK_STREAM)
+
+    # Step 2: Prevent existing sys.stdin wrapper from closing FD 0 or reused descriptors on GC
+    old_stdin = sys.stdin
+    if old_stdin is not None:
+        try:
+            old_stdin.close()
+        except Exception:
+            pass
+
+    # Step 3: Redirect raw descriptor to /dev/null
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    if devnull_fd != raw_fd:
+        os.dup2(devnull_fd, raw_fd)
+        os.close(devnull_fd)
+
+    # Step 4: Re-bind sys.stdin with closefd=False
+    sys.stdin = open(raw_fd, "r", closefd=False)
+    return sock
+
+
+def run_worker_socket(
+    sock: socket.socket,
     simulate_incompatible_version: bool = False,
 ) -> int:
-    """Connect to the daemon's private Unix domain socket and run the worker event loop."""
-    if not os.path.exists(socket_path):
-        print(f"[worker] Error: socket path does not exist: {socket_path}", file=sys.stderr)
-        return 1
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        sock.connect(socket_path)
-    except Exception as e:
-        print(f"[worker] Failed to connect to socket {socket_path}: {e}", file=sys.stderr)
-        return 1
-
+    """Runs the worker event loop over an already-connected Unix domain socket."""
     sock_file = BoundedSocketFile(sock)
 
     try:
@@ -401,17 +420,47 @@ def run_worker(
             pass
 
 
+def run_worker(
+    socket_path: str,
+    simulate_incompatible_version: bool = False,
+) -> int:
+    """Connect to the daemon's private Unix domain socket and run the worker event loop."""
+    if not os.path.exists(socket_path):
+        print(f"[worker] Error: socket path does not exist: {socket_path}", file=sys.stderr)
+        return 1
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(socket_path)
+    except Exception as e:
+        print(f"[worker] Failed to connect to socket {socket_path}: {e}", file=sys.stderr)
+        return 1
+
+    return run_worker_socket(sock, simulate_incompatible_version=simulate_incompatible_version)
+
+
 def main(args: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aurora-worker",
-        description="Aurora OS AI Worker Stub (M5 Vertical Slice)",
+        description="Aurora OS AI Worker Stub (M9 Vertical Slice)",
     )
     parser.add_argument(
         "--socket-path",
         "-s",
         type=str,
         required=False,
-        help="Path to the private Unix domain socket hosted by aurora-ai daemon",
+        help="Path to the private Unix domain socket hosted by aurora-ai daemon (legacy)",
+    )
+    parser.add_argument(
+        "--ipc-fd",
+        type=int,
+        default=None,
+        help="File descriptor for anonymous socketpair IPC",
+    )
+    parser.add_argument(
+        "--stdio-ipc",
+        action="store_true",
+        help="Use standard input (FD 0) for anonymous socketpair IPC",
     )
     parser.add_argument(
         "--simulate-incompatible-version",
@@ -421,15 +470,22 @@ def main(args: Optional[list[str]] = None) -> int:
 
     parsed = parser.parse_args(args if args is not None else sys.argv[1:])
 
-    if not parsed.socket_path:
-        print(f"aurora-ai worker stub skeleton (M2)")
-        print(f"Protocol version: {CURRENT_PROTOCOL_VERSION}")
-        return 0
+    if parsed.ipc_fd is not None:
+        sock = init_socket_from_fd(parsed.ipc_fd)
+        return run_worker_socket(sock, simulate_incompatible_version=parsed.simulate_incompatible_version)
+    elif parsed.stdio_ipc or "AURORA_AI_IPC_FD" in os.environ:
+        raw_fd = int(os.environ.get("AURORA_AI_IPC_FD", 0))
+        sock = init_socket_from_fd(raw_fd)
+        return run_worker_socket(sock, simulate_incompatible_version=parsed.simulate_incompatible_version)
+    elif parsed.socket_path:
+        return run_worker(
+            parsed.socket_path,
+            simulate_incompatible_version=parsed.simulate_incompatible_version,
+        )
 
-    return run_worker(
-        parsed.socket_path,
-        simulate_incompatible_version=parsed.simulate_incompatible_version,
-    )
+    print(f"aurora-ai worker stub skeleton (M2)")
+    print(f"Protocol version: {CURRENT_PROTOCOL_VERSION}")
+    return 0
 
 
 if __name__ == "__main__":
