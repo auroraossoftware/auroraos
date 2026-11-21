@@ -2,7 +2,7 @@
 
 * **Status:** Living Document
 * **Authoritative Architecture Context:** [ADR-001](decisions/0001-core-daemon-and-worker-runtime-architecture.md), [ADR-002](decisions/0002-capability-and-permission-architecture.md), and [Vertical Slice Prototype Design](vertical-slice-prototype-design.md)
-* **Current Progress:** Milestones 1–9 Complete
+* **Current Progress:** Milestones 1–9 Complete; Milestone 10 in Progress (M10a Complete)
 
 ---
 
@@ -12,7 +12,7 @@ The milestones documented below track prototype implementation progress against 
 
 1. **Deterministic Worker Stub (No Neural Models):** The AI worker process is a deterministic Python stub simulating reasoning and intent formulation; no real LLM, model runtime (PyTorch/llama.cpp), embeddings, or inference engine has been introduced.
 2. **IPC & Caller Authentication:** Public D-Bus IPC, system bus interfaces, and production caller authentication (e.g., Polkit integration, bus credentials) are deliberately deferred. In M1–M5, callers are represented via internal principal abstractions and direct CLI flags.
-3. **Worker Sandboxing & Ambient Authority:** Operating-system-level confinement (e.g., custom seccomp-bpf filters, Landlock, cgroups, user/mount namespaces) has not yet been established. The worker currently executes as a standard unprivileged child process sharing the daemon's UID. While capability permissions and policy gates are strictly enforced at the daemon's dispatcher boundary, the worker process retains the ambient OS authority of its executing UID (including direct filesystem access to world-readable files and shared same-UID directories). True zero-ambient-authority confinement requires dedicated OS sandboxing in a future milestone.
+3. **Worker Sandboxing & Ambient Authority:** Operating-system-level confinement (e.g., custom seccomp-bpf filters, Landlock, cgroups, user/mount namespaces) was not present in Milestones 1–9; the worker executed as a standard unprivileged child process sharing the daemon's UID and retaining ambient OS authority. Milestone 10 establishes operating-system-enforced confinement across four structured sub-milestones (M10a Threat Model & Requirements, M10b Sandbox Architecture & Design, M10c Implementation, M10d Adversarial Testing & Audit) to eliminate ambient authority and enforce zero-trust isolation on the worker process.
 4. **Test Reporting:** All reported passing tests are implementation-reported automated test suite results verifying internal structural contracts, fail-closed boundaries, and execution paths; they do not represent independent third-party security certification.
 5. **IPC Transport Migration & Accepted ADR-003:** In Milestone 9, the internal daemon ↔ worker communication transport was transitioned to anonymous connected Unix stream socket pairs (`socketpair(AF_UNIX, SOCK_STREAM, 0)`), pursuant to Accepted ADR-003. This eliminated all filesystem pathname races, stale socket entries, directory permission dependencies, and pathname-based connection discovery for this private channel. Low-descriptor safety ($\ge 3$), standard descriptor mapping (`Stdio::from(OwnedFd)`), child process group isolation (`process_group(0)`), orderly shutdown escalation (EOF $\to$ SIGTERM $\to$ SIGKILL $\to$ `wait()`), and emergency parent-death containment via `PR_SET_PDEATHSIG(SIGKILL)` are active. Operating-system process isolation, kernel sandboxing, and ambient file authority remain distinct security boundaries to be addressed in subsequent milestones.
 
@@ -31,6 +31,7 @@ The milestones documented below track prototype implementation progress against 
 | **M7** | Security, Rejection & Fault Containment Tests | **Complete** (Reconciled Prototype Scope) | Adversarial test harness, non-destructive socket pre-checking, fail-closed invalidation, and documented threat-model boundaries. |
 | **M8** | System Audit & Performance Baselines | **Complete** | End-to-end audit, performance baselines, proposal flood protection, and proposed ADR-003. |
 | **M9** | Reliable IPC & Worker Lifecycle Management | **Complete** | Anonymous socketpair IPC, low-descriptor safety, lazy recovery with bounded restarts, PR_SET_PDEATHSIG child containment, orderly shutdown ladder. |
+| **M10** | Operating-System-Enforced Worker Sandboxing | **In Progress** (M10a Complete) | Process confinement: pre-exec isolation, Landlock filesystem controls, Seccomp-BPF, cgroups v2, network disconnection. |
 
 ---
 
@@ -526,3 +527,81 @@ The milestones documented below track prototype implementation progress against 
   * Worker Runtime: `worker/main.py`
   * Rust Tests: `crates/aurora-ai/tests/m9_socketpair_lifecycle_tests.rs`
   * Python Tests: `worker/test_worker.py`
+
+---
+
+## 5. Milestone 10: Operating-System-Enforced Worker Sandboxing & Security Boundaries
+
+* **Status:** In Progress (Sub-milestone M10a Complete; M10b, M10c, M10d Planned)
+* **Objective:** "If the Python AI worker is completely compromised, it must not gain unrestricted access to the host system. It must operate within an explicitly defined, operating-system-enforced security boundary."
+* **Execution Strategy:** Divided into four strictly sequential sub-milestones:
+
+---
+
+### Sub-milestone M10a: Threat Model and Security Requirements
+* **Status:** Complete
+* **Purpose:** Establish the formal threat model for a fully compromised AI worker process, catalog all attack surfaces and ambient authority risks, establish explicit inherited descriptor allowlists, and define the complete set of operating-system-enforced security requirements.
+* **Main Deliverables:**
+  * **AI Worker Threat Model ([`docs/security/worker-threat-model.md`](security/worker-threat-model.md)):**
+    - Threat actor profile under full Arbitrary Code Execution (ACE) without Python cooperative constraints.
+    - Attack surface catalog across host filesystem access, network exfiltration, process tampering/signaling, resource exhaustion (fork-bombs, memory pressure), and direct capability bypass.
+    - Explicit inherited file descriptor allowlist: FD 0 (IPC socket stream, strictly prohibiting `SCM_RIGHTS` descriptor smuggling), FD 1 (`/dev/null`), FD 2 (`/dev/null` or non-terminal pipe; prohibited from inheriting interactive terminal `Stdio::inherit()` to eliminate `TIOCSTI` terminal injection); mandatory `close_range(3, ~0U, 0)`.
+    - Honest accounting of current host security controls (DAC permissions, POSIX ACLs, AppArmor, Yama ptrace restrictions).
+    - Clarification that `PR_SET_DUMPABLE(0)` prevents external processes from tracing the worker, while Seccomp, Yama, and PID namespaces prevent the worker from tracing external processes.
+    - Clear distinction between temporary development paths and deployment-independent runtime paths.
+  * **Worker Security & Sandbox Requirements ([`docs/security/worker-sandbox-requirements.md`](security/worker-sandbox-requirements.md)):**
+    - 10 formal security requirements (SEC-REQ-01 through SEC-REQ-10).
+    - Confinement-Before-Execution Invariant: Essential confinement must be established externally before untrusted Python code, imports, or native extensions execute.
+    - Prohibition of worker self-reporting trust: External deterministic verification via procfs (`/proc/<pid>/status`) complemented by trusted launcher sync-pipe confirmation.
+    - Filesystem partitioning: Default-deny host VFS, read-only whitelist on runtime & Python stdlib, restricted writable scratch directory with aggregate storage quotas (`RLIMIT_FSIZE` bounds individual files only).
+    - Network disconnection by default (`CLONE_NEWNET` or Seccomp socket blocks).
+    - Seccomp-BPF policy: Syscall allowlist, thread creation (`CLONE_THREAD`), signal delivery syscalls, and multi-thread synchronization (`SECCOMP_FILTER_FLAG_TSYNC`).
+    - Resource controls: Evaluation of Cgroup v2 (`pids.max`, `memory.max`, `cpu.max`) with explanation of the POSIX `RLIMIT_NPROC` per-UID trap; strict mode refuses startup if mandatory controls are unavailable.
+    - Evaluation of Landlock LSM ABI compatibility: Runtime probed as ABI v4 (Linux 6.8 baseline; ABI v5 from 6.10; ABI 8 TSYNC available from Linux 7.0); single-threaded launcher remains baseline to ensure compatibility with kernels lacking ABI 8, with TSYNC as an optional capability when probed.
+    - PID namespace creation and `/proc` semantics: child-entry invariant via fork into unshared PID namespace and private procfs instance mounting.
+    - Evaluation of a dedicated native trusted launcher (`aurora-worker-launcher`).
+* **Relevant Documents:**
+  * Threat Model: [`docs/security/worker-threat-model.md`](security/worker-threat-model.md)
+  * Sandbox Requirements: [`docs/security/worker-sandbox-requirements.md`](security/worker-sandbox-requirements.md)
+
+---
+
+### Sub-milestone M10b: Sandbox Architecture and Design
+* **Status:** Planned
+* **Purpose:** Specify the concrete architecture and design of the sandbox subsystem, including the trusted launcher binary, Landlock ruleset construction, Seccomp-BPF filter compilation, cgroup v2 integration, and supervisor lifecycle coordination.
+* **Planned Deliverables:**
+  * Proposed ADR-004: Operating-System-Level Sandboxing and Confinement for AI Worker Processes.
+  * Architectural design specification for the `aurora-worker-launcher` native executable.
+  * Detailed Seccomp-BPF system call allowlist specification and BPF program design.
+  * Landlock ruleset composition, path resolution, and ABI fallback handling.
+  * Cgroup v2 hierarchy design and systemd scope delegation integration.
+  * External verification protocol design in `WorkerSupervisor`.
+
+---
+
+### Sub-milestone M10c: Sandbox Implementation
+* **Status:** Planned
+* **Purpose:** Implement the sandbox launcher, supervisor integration, procfs verification, and runtime isolation controls without regressing existing M1–M9 vertical slice capabilities or IPC contracts.
+* **Planned Deliverables:**
+  * Trusted launcher binary implementation.
+  * Supervisor integration: spawning worker via trusted launcher with low-descriptor safety.
+  * Procfs external verification checks (`/proc/<pid>/status` for `NoNewPrivs` and `Seccomp`).
+  * Restricted scratch directory lifecycle management.
+  * Error mapping: `SupervisorError::SandboxUnavailable`, `SupervisorError::SandboxVerificationFailed`.
+
+---
+
+### Sub-milestone M10d: Adversarial Testing and Security Audit
+* **Status:** Planned
+* **Purpose:** Execute a comprehensive adversarial security test harness from inside the confined worker process to rigorously verify all SEC-REQ requirements, conduct a penetration audit, and verify regression safety across all capabilities.
+* **Planned Deliverables:**
+  * Adversarial security test suite verifying:
+    - Attempted read of user `$HOME` or `/etc` returns `EACCES` / `EPERM`.
+    - Attempted write outside scratch directory returns `EACCES` / `EPERM`.
+    - Attempted network socket creation (`AF_INET`/`AF_INET6`) returns `EPERM`.
+    - Attempted process creation beyond cgroup limit fails.
+    - Attempted `execve` or `ptrace` fails.
+    - Attempted access to closed file descriptors ($\ge 3$) fails (`EBADF`).
+  * Descriptor leak invariance test suite under sandboxing.
+  * Full regression test pass across all 4 capabilities (`sys.cpu.read`, `sys.memory.read`, `proc.list`, `fs.file.read`).
+  * Milestone 10 Comprehensive Security Audit Report.
