@@ -41,3 +41,4 @@ Each ADR documents:
 | [ADR-001](0001-core-daemon-and-worker-runtime-architecture.md) | Core Daemon Language, Initial Worker Runtime, and Process Boundary | Proposed | 2026-09-19 |
 | [ADR-002](0002-capability-and-permission-architecture.md) | Capability and Permission Architecture | Proposed | 2026-09-19 |
 | [ADR-003](0003-socketpair-ipc-transport.md) | Anonymous Socketpair IPC Transport for Internal Worker Communication | Accepted | 2026-10-27 (Proposed) / 2026-11-13 (Accepted) |
+| [ADR-004](0004-worker-os-sandboxing-and-process-isolation.md) | Operating-System-Level Sandboxing and Confinement for AI Worker Processes | Accepted | 2026-11-23 |

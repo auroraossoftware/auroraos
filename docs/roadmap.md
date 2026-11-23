@@ -532,7 +532,7 @@ The milestones documented below track prototype implementation progress against 
 
 ## 5. Milestone 10: Operating-System-Enforced Worker Sandboxing & Security Boundaries
 
-* **Status:** In Progress (Sub-milestone M10a Complete; M10b, M10c, M10d Planned)
+* **Status:** In Progress (Sub-milestones M10a and M10b Complete; M10c and M10d Planned)
 * **Objective:** "If the Python AI worker is completely compromised, it must not gain unrestricted access to the host system. It must operate within an explicitly defined, operating-system-enforced security boundary."
 * **Execution Strategy:** Divided into four strictly sequential sub-milestones:
 
@@ -563,19 +563,36 @@ The milestones documented below track prototype implementation progress against 
 * **Relevant Documents:**
   * Threat Model: [`docs/security/worker-threat-model.md`](security/worker-threat-model.md)
   * Sandbox Requirements: [`docs/security/worker-sandbox-requirements.md`](security/worker-sandbox-requirements.md)
+  * Milestone 10a Plan: [`docs/plans/m10/m10a-plan.md`](plans/m10/m10a-plan.md)
 
 ---
 
 ### Sub-milestone M10b: Sandbox Architecture and Design
-* **Status:** Planned
-* **Purpose:** Specify the concrete architecture and design of the sandbox subsystem, including the trusted launcher binary, Landlock ruleset construction, Seccomp-BPF filter compilation, cgroup v2 integration, and supervisor lifecycle coordination.
-* **Planned Deliverables:**
-  * Proposed ADR-004: Operating-System-Level Sandboxing and Confinement for AI Worker Processes.
-  * Architectural design specification for the `aurora-worker-launcher` native executable.
-  * Detailed Seccomp-BPF system call allowlist specification and BPF program design.
-  * Landlock ruleset composition, path resolution, and ABI fallback handling.
-  * Cgroup v2 hierarchy design and systemd scope delegation integration.
-  * External verification protocol design in `WorkerSupervisor`.
+* **Status:** Complete
+* **Purpose:** Specify the concrete architecture and design of the sandbox subsystem, formalize ADR-004, and design the trusted launcher binary, rootfs construction, Landlock ruleset, Seccomp-BPF filters, cgroup v2 integration, and supervisor lifecycle coordination.
+* **Approved Architecture & Deliverables:**
+  * **Approved Option C (Hybrid Architecture):** Native Rust Trusted Launcher (`aurora-worker-launcher`) combined with systemd D-Bus transient scope cgroup v2 containment (`memory.max=512M`, `pids.max=32`, `cpu.max=100%`).
+  * **Accepted ADR-004 ([`docs/decisions/0004-worker-os-sandboxing-and-process-isolation.md`](decisions/0004-worker-os-sandboxing-and-process-isolation.md)):** Formal decision record establishing Option C, three-tier supervision (`aurora-ai` $\to$ `aurora-worker-launcher` $\to$ Python PID 1), namespace isolation, Landlock ABI v4, progressive Seccomp, and strict safe refusal.
+  * **M10b Architecture Specification ([`docs/architecture/m10b-sandbox-design.md`](architecture/m10b-sandbox-design.md)):** Comprehensive 26-section standalone engineering specification consolidating the complete approved sandbox architecture.
+  * **M10b Plan Record ([`docs/plans/m10/m10b-plan.md`](plans/m10/m10b-plan.md)):** Permanent record of the approved M10b planning process, workstreams A–H, trade-off evaluations, and acceptance criteria.
+  * **Core Architectural Invariants Formalized:**
+    - Three-tier supervision hierarchy: Launcher acts as single-threaded reaper proxy, mirroring worker exit codes and terminating signals to `WorkerSupervisor`.
+    - Four namespaces: Unprivileged User NS (`CLONE_NEWUSER`), Network NS (`CLONE_NEWNET`, loopback DOWN), PID NS (`CLONE_NEWPID`, worker is PID 1), and independent Mount NS (`CLONE_NEWNS`, private propagation).
+    - Minimal rootfs via atomic `pivot_root`: Read-only `/usr`, `/lib`, `/lib64`, `/app`; minimal `/dev` (`/dev/null`, `/dev/zero`, `/dev/urandom`); 128M scratch tmpfs (`noexec`); host detached with `MNT_DETACH`.
+    - Procfs `subset=pid`: Hides host telemetry (`/proc/stat`, `/proc/meminfo`); strict mode enforces safe refusal if unsupported.
+    - Scoped Landlock ABI v4: Execution restricted strictly and exclusively to `/usr/bin/python3` and dynamic linker.
+    - Two-stage Seccomp-BPF: Stage 1 blocks `clone3` (forcing glibc fallback to `clone` with mandatory `CLONE_THREAD`), blocks `io_uring`, blocks `SYS_socket`/`SYS_socketpair`/`SCM_RIGHTS`; Stage 2 permanently seals `execve`/`execveat` with `TSYNC` post-bootstrap via `aurora_seal`.
+    - Python trusted bootstrap: Invoked as `python3 -I -S -B /app/worker/bootstrap.py`; loads `aurora_seal` via modern `importlib.util` APIs; registers PID 1 SIGTERM handler before sending `HandshakeResponse`.
+    - Authoritative 7-stage FD ownership manifest: Immediate launcher closure of FD 0 post-fork; `close_range(10, UINT_MAX, 0)` post-pivot purge; staged closure of FDs 3, 4, 5, 6–9; zero host descriptor leakage.
+    - Two-way parent-death protection: Worker arms `PR_SET_PDEATHSIG(SIGKILL)` after credential drops, exchanges `TOKEN_ARMED`/`TOKEN_CONTINUE` with launcher, closing the fork-to-prctl race.
+    - Preservation of M9 IPC and lifecycle contracts: 512 KiB framing, 200 ms EOF $\to$ 300 ms SIGTERM $\to$ SIGKILL escalation ladder.
+* **Relevant Documents:**
+  * ADR-004: [`docs/decisions/0004-worker-os-sandboxing-and-process-isolation.md`](decisions/0004-worker-os-sandboxing-and-process-isolation.md)
+  * Architecture Specification: [`docs/architecture/m10b-sandbox-design.md`](architecture/m10b-sandbox-design.md)
+  * Milestone 10b Plan: [`docs/plans/m10/m10b-plan.md`](plans/m10/m10b-plan.md)
+  * Threat Model: [`docs/security/worker-threat-model.md`](security/worker-threat-model.md)
+  * Sandbox Requirements: [`docs/security/worker-sandbox-requirements.md`](security/worker-sandbox-requirements.md)
+
 
 ---
 
