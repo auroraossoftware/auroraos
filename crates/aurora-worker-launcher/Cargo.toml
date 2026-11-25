@@ -1,0 +1,16 @@
+[package]
+name = "aurora-worker-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Trusted native launcher and sandboxed isolation boundary for Aurora OS AI worker"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "aurora-worker-launcher"
+path = "src/main.rs"
+
+[[bin]]
+name = "aurora-dummy-probe"
+path = "src/bin/dummy_probe.rs"

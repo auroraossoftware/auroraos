@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "crates/aurora-ai",
     "crates/aurora-protocol",
+    "crates/aurora-worker-launcher",
 ]
